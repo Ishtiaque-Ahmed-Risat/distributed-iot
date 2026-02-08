@@ -3,6 +3,7 @@
 A distributed IoT system with edge processing, real-time ML inference, and cloud analytics.
 
 ## Architecture
+![System Architecture](docs/architecture.png)
 
 ```
 IoT Devices → Device Registry (descriptions) 
