@@ -1,0 +1,45 @@
+# IoT Device Simulator Configuration
+
+mqtt:
+  broker: "localhost"  # Change to edge gateway IP for remote
+  port: 1883
+  topic_template: "sensors/{device_id}/data"
+  qos: 1  # QoS 1 = at least once delivery
+
+# Device Registry (optional - for registering devices with metadata)
+device_registry:
+  enabled: true  # Set to false to skip registration
+  url: "http://localhost:8080"  # Device registry API endpoint
+
+simulation:
+  num_devices: 10  # Start with 10 devices (scale up to 1000+)
+  interval_seconds: 10  # Publish every 10 seconds
+
+# Sensor type configurations
+sensor_types:
+  temperature:
+    initial_value: 22.0
+    min_value: -10.0
+    max_value: 50.0
+    variation_min: -0.5
+    variation_max: 0.5
+    unit: "celsius"
+    anomaly_rate: 0.02  # 2% chance of anomaly
+  
+  humidity:
+    initial_value: 50.0
+    min_value: 0.0
+    max_value: 100.0
+    variation_min: -2.0
+    variation_max: 2.0
+    unit: "percent"
+    anomaly_rate: 0.01
+  
+  pressure:
+    initial_value: 1013.25
+    min_value: 950.0
+    max_value: 1050.0
+    variation_min: -1.0
+    variation_max: 1.0
+    unit: "hPa"
+    anomaly_rate: 0.01
