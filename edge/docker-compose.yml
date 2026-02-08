@@ -1,0 +1,242 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # MQTT Broker - EMQX
+  # ============================================
+  emqx:
+    image: emqx:5.5
+    container_name: edge-emqx
+    ports:
+      - "1883:1883"      # MQTT
+      - "8083:8083"      # WebSocket
+      - "18083:18083"    # Dashboard
+    environment:
+      - EMQX_NAME=emqx
+      - EMQX_HOST=127.0.0.1
+      - EMQX_NODE__COOKIE=secretcookie
+      # Persistence
+      - EMQX_MQTT__SESSION_EXPIRY_INTERVAL=2h
+      - EMQX_MQTT__MAX_INFLIGHT=100
+    volumes:
+      - emqx-data:/opt/emqx/data
+      - emqx-log:/opt/emqx/log
+    networks:
+      - edge-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "emqx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Scaling (for production):
+    # deploy:
+    #   replicas: 3
+    #   resources:
+    #     limits:
+    #       cpus: '1'
+    #       memory: 1G
+
+  # ============================================
+  # Message Queue - Redpanda
+  # ============================================
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.5
+    container_name: edge-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "19092:19092"  # Kafka API (external)
+      - "18082:18082"  # HTTP Proxy (external)
+      - "18081:18081"  # Schema Registry (external)
+      - "9644:9644"    # Admin API
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - edge-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    # Scaling (for production cluster):
+    # deploy:
+    #   replicas: 3
+    #   resources:
+    #     limits:
+    #       cpus: '2'
+    #       memory: 2G
+
+  # ============================================
+  # Time-Series Database - InfluxDB
+  # ============================================
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: edge-influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=adminpassword
+      - DOCKER_INFLUXDB_INIT_ORG=iot-org
+      - DOCKER_INFLUXDB_INIT_BUCKET=sensor-data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-super-secret-token
+      - DOCKER_INFLUXDB_INIT_RETENTION=7d  # 7-day retention
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    networks:
+      - edge-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Resources:
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1'
+    #       memory: 2G
+
+  # ============================================
+  # Data Ingestion Service (Python)
+  # ============================================
+  ingestion-service:
+    build:
+      context: ./services/ingestion
+      dockerfile: Dockerfile
+    container_name: edge-ingestion
+    environment:
+      - MQTT_BROKER=tcp://emqx:1883
+      - MQTT_TOPIC=sensors/+/data
+      - REDPANDA_BROKERS=redpanda:9092
+      - REDPANDA_TOPIC=raw-sensor-data
+    depends_on:
+      emqx:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    networks:
+      - edge-network
+    restart: unless-stopped
+    # Scaling:
+    # deploy:
+    #   replicas: 3
+    #   resources:
+    #     limits:
+    #       cpus: '0.5'
+    #       memory: 512M
+
+  # ============================================
+  # Device Registry Service (Python FastAPI)
+  # REST API for device registration with descriptions
+  # ============================================
+  device-registry:
+    build:
+      context: ./services/device-registry
+      dockerfile: Dockerfile
+    container_name: edge-device-registry
+    ports:
+      - "8080:8080"  # REST API
+    environment:
+      - PORT=8080
+    networks:
+      - edge-network
+    restart: unless-stopped
+    # Future: Add persistent storage
+    # volumes:
+    #   - device-registry-data:/data
+
+  # ============================================
+  # Data Transformation Service (Python)
+  # Converts units, standardizes semantic types
+  # LLM-ready for future integration
+  # ============================================
+  transformation-service:
+    build:
+      context: ./services/transformation
+      dockerfile: Dockerfile
+    container_name: edge-transformation
+    environment:
+      - REDPANDA_BROKERS=redpanda:9092
+      - INPUT_TOPIC=raw-sensor-data
+      - OUTPUT_TOPIC=transformed-sensor-data
+      - CONSUMER_GROUP=transformation-service
+      - ENABLE_LLM=false  # Set to 'true' when LLM service is deployed
+      - LLM_SERVICE_URL=http://llm-service:8080
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - edge-network
+    restart: unless-stopped
+    # Scaling:
+    # deploy:
+    #   replicas: 2
+    #   resources:
+    #     limits:
+    #       cpus: '0.5'
+    #       memory: 512M
+
+  # ============================================
+  # InfluxDB Writer Service (Python)
+  # Now reads from TRANSFORMED data
+  # ============================================
+  influxdb-writer:
+    build:
+      context: ./services/influxdb-writer
+      dockerfile: Dockerfile
+    container_name: edge-influxdb-writer
+    environment:
+      - REDPANDA_BROKERS=redpanda:9092
+      - REDPANDA_TOPIC=transformed-sensor-data  # Changed from raw-sensor-data
+      - CONSUMER_GROUP=influxdb-writer
+      - INFLUX_URL=http://influxdb:8086
+      - INFLUX_TOKEN=my-super-secret-token
+      - INFLUX_ORG=iot-org
+      - INFLUX_BUCKET=sensor-data
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+      transformation-service:
+        condition: service_started  # Wait for transformation service
+    networks:
+      - edge-network
+    restart: unless-stopped
+    # Scaling:
+    # deploy:
+    #   replicas: 2
+    #   resources:
+    #     limits:
+    #       cpus: '0.5'
+    #       memory: 512M
+
+networks:
+  edge-network:
+    driver: bridge
+
+volumes:
+  emqx-data:
+  emqx-log:
+  redpanda-data:
+  influxdb-data:
+  influxdb-config:
