@@ -1,0 +1,111 @@
+version: '3.8'
+
+# Cloud services (Phase 3)
+# This will be expanded in later phases with:
+#   - Redpanda cluster
+#   - Cassandra cluster
+#   - MinIO
+#   - Spark
+#   - API Gateway
+#   - ML Training services
+
+services:
+  # ============================================
+  # Message Queue - Redpanda (Cloud)
+  # ============================================
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.5
+    container_name: cloud-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=2
+      - --memory=2G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:29092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:29092
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:28082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:28082
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:28081
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "29092:29092"  # Kafka API
+      - "28082:28082"  # HTTP Proxy
+      - "28081:28081"  # Schema Registry
+      - "29644:9644"   # Admin API
+    volumes:
+      - cloud-redpanda-data:/var/lib/redpanda/data
+    networks:
+      - cloud-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ============================================
+  # Cassandra (Time-Series Database)
+  # ============================================
+  cassandra:
+    image: cassandra:4.1
+    container_name: cloud-cassandra
+    ports:
+      - "9042:9042"   # CQL
+      - "7199:7199"   # JMX
+    environment:
+      - CASSANDRA_CLUSTER_NAME=IoTCluster
+      - CASSANDRA_DC=DC1
+      - CASSANDRA_RACK=Rack1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      - MAX_HEAP_SIZE=1G
+      - HEAP_NEWSIZE=256M
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    networks:
+      - cloud-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    # Scaling (for production):
+    # deploy:
+    #   replicas: 3
+
+  # ============================================
+  # MinIO (S3-compatible Data Lake)
+  # ============================================
+  minio:
+    image: minio/minio:latest
+    container_name: cloud-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio-data:/data
+    networks:
+      - cloud-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  cloud-network:
+    driver: bridge
+
+volumes:
+  cloud-redpanda-data:
+  cassandra-data:
+  minio-data:
