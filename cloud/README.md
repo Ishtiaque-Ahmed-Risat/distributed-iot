@@ -1,50 +1,103 @@
 # Cloud Infrastructure
 
-Cloud services for batch analytics, ML training, and long-term storage. **Note**: Cloud infrastructure is not yet implemented for K3s deployment.
+Cloud services for long-term storage, batch analytics, ML training, and REST API.  
+Deployed via **Docker Compose** on the cloud/datacenter side.
 
-## Planned Architecture
+## Architecture
 
 ```
-Edge Gateway (K3s)
-      ↓ (Cloud Uplink Service - TODO)
-Cloud Redpanda (Message Bus)
-      ↓
-Cassandra (Long-term Time-series Storage)
-MinIO (Data Lake for raw data)
-Spark (Batch Analytics)
-ML Training Pipeline (Cloud-based model updates)
+Edge (K3s)                              Cloud (Docker Compose)
+─────────────                           ──────────────────────
+Edge Redpanda                           Cloud Redpanda
+  └─ Cloud Uplink ──────────────────→     └─ Cassandra Writer ──→ Cassandra
+                                                                    ↑
+                                          Cloud API (FastAPI) ──────┘
+                                          Spark Job (batch) ────────┘
+                                          MinIO (model store)
 ```
 
-## Components (Planned)
+## Quick Start
 
-### Infrastructure
-- **Redpanda**: Central message bus for all edge gateways
-- **Cassandra**: Distributed time-series database
-- **MinIO**: S3-compatible data lake for raw sensor data
-- **Spark**: Batch processing for historical analytics
+```bash
+# 1. Start cloud services
+cd cloud
+./start-cloud.sh
 
-### Services
-- **Cloud Uplink**: Periodic sync from edge InfluxDB to cloud (every 1 minute)
-- **API Gateway**: REST API for querying historical data
-- **ML Training**: Train models on aggregated data, push to edge
-- **Analytics Dashboard**: Grafana-based visualization
+# 2. Build & deploy edge (including cloud-uplink)
+cd ../edge
+./k3s-build-images.sh
+./k3s-deploy.sh
 
-## Current Status
+# 3. Run the simulator
+cd ../simulator
+./run-simulator.sh
 
-**Phase 1 (Completed)**: Edge gateway with K3s deployment ✅  
-**Phase 2 (TODO)**: Cloud infrastructure deployment  
-**Phase 3 (TODO)**: Edge-cloud integration and ML pipeline
+# 4. Verify data flow
+curl http://localhost:8000/api/v1/devices           # List devices
+curl http://localhost:8000/api/v1/devices/device_0000/latest  # Latest readings
 
-## Future Implementation
+# 5. Run ML training job (on demand)
+cd ../cloud
+docker-compose -f docker-compose.yml -f docker-compose.job.yml run spark-job
+```
 
-Cloud services will be deployed on:
-- **Kubernetes** (for production cloud deployment)
-- **K3s** (for local testing and development)
+## Components
 
-Deployment manifests will be created in `cloud/k8s/` directory.
+| Service | Port | Description |
+|---------|------|-------------|
+| **Redpanda** | `29092` (Kafka), `29644` (Admin) | Message bus receiving edge data |
+| **Cassandra** | `9042` | Long-term time-series storage (90-day retention) |
+| **MinIO** | `9000` (API), `9001` (Console) | S3-compatible data lake for ML models |
+| **Cassandra Writer** | — | Consumes `edge-sensor-data` → writes to Cassandra |
+| **Cloud API** | `8000` | REST API for querying historical data ([Swagger UI](http://localhost:8000/docs)) |
+| **Spark Job** | — | On-demand batch analytics + ML model training |
 
-## See Also
+## Cassandra Schema
 
-- [Edge Gateway](../edge/README.md) - Currently implemented
-- [Project README](../README.md) - Overall project structure
-- [OPTIMIZATION_SUMMARY.md](../OPTIMIZATION_SUMMARY.md) - Edge architecture decisions
+Time-bucketed design for fast per-device queries:
+
+```
+sensor_readings:  PRIMARY KEY ((device_id, date), timestamp DESC)
+device_latest:    PRIMARY KEY (device_id, sensor_type)
+device_stats:     PRIMARY KEY ((device_id, date), sensor_type, hour)
+```
+
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check |
+| GET | `/api/v1/devices` | List all device IDs |
+| GET | `/api/v1/devices/{id}/readings` | Historical readings (filterable) |
+| GET | `/api/v1/devices/{id}/latest` | Latest reading per sensor |
+| GET | `/api/v1/devices/{id}/stats` | Aggregated statistics |
+| GET | `/api/v1/export/{id}?date=YYYY-MM-DD` | Export full day of data |
+
+## Data Ordering Guarantee
+
+Per-device ordering is preserved end-to-end:
+1. Edge Redpanda: `key=device_id` → same partition per device
+2. Cloud Uplink: same key preserved in cloud Redpanda
+3. Cloud Redpanda: `key=device_id` → same partition
+4. Cassandra Writer: single consumer per partition → sequential writes
+5. Cassandra: `CLUSTERING ORDER BY (timestamp DESC)` → sorted on read
+
+## Useful Commands
+
+```bash
+# View logs
+docker-compose logs -f cassandra-writer
+docker-compose logs -f cloud-api
+
+# Check Cassandra data
+docker exec -it cloud-cassandra cqlsh -e "SELECT * FROM iot_data.device_latest LIMIT 10;"
+
+# Check Redpanda topics
+docker exec -it cloud-redpanda rpk topic list
+
+# Stop cloud
+./stop-cloud.sh
+
+# Stop + remove all data
+docker-compose down -v
+```

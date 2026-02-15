@@ -9,8 +9,11 @@ echo "========================================"
 
 cd "$(dirname "$0")"
 
-docker-compose down
+docker compose down
 
 echo ""
 echo "Cloud services stopped."
+echo ""
+echo "To also remove data volumes:"
+echo "  docker compose down -v"
 echo ""

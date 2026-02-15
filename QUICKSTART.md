@@ -23,7 +23,7 @@ docker --version   # Docker 20.10+
 
 | Script | Purpose | When to Use |
 |--------|---------|-------------|
-| **`k3s-build-images.sh`** | Build Docker images | First time, or after code changes |
+| **`k3s-build-images.sh`** | Build Docker images (edge + uplink) | First time, or after code changes |
 | **`k3s-deploy.sh`** | Full deploy (infra + services) | Quick one-shot deployment |
 | **`k3s-deploy-infra.sh`** | Deploy infra (EMQX, Redpanda, InfluxDB, topics) | Manual control: run first |
 | **`k3s-deploy-services.sh`** | Deploy services (after infra is up) | Manual control: run second |
@@ -31,6 +31,13 @@ docker --version   # Docker 20.10+
 | **`local-mode.sh`** | Scale back to default (2 replicas) | After demos (save resources) |
 | **`k3s-status.sh`** | Check system status | Anytime |
 | **`k3s-undeploy.sh`** | Remove all resources | Clean up |
+
+**Cloud scripts** (in `cloud/`):
+
+| Script | Purpose | When to Use |
+|--------|---------|-------------|
+| **`start-cloud.sh`** | Start cloud infra + services | Before starting edge uplink |
+| **`stop-cloud.sh`** | Stop cloud services | Cleanup |
 
 **Typical workflow:**
 ```bash
@@ -66,12 +73,25 @@ my-node    Ready    control-plane,master   30s   v1.28.5+k3s1
 
 ---
 
-## Step 2: Deploy Edge Gateway (3 minutes)
+## Step 2: Start Cloud Services (2 minutes)
 
 ```bash
-cd edge
+cd cloud
+./start-cloud.sh
+```
 
-# Build images
+This starts Redpanda, Cassandra, MinIO, Cassandra Writer, and Cloud API.
+
+**Verify:** Open http://localhost:8000/docs (Cloud API Swagger UI)
+
+---
+
+## Step 3: Deploy Edge Gateway (3 minutes)
+
+```bash
+cd ../edge
+
+# Build images (includes cloud-uplink service)
 ./k3s-build-images.sh
 
 # Deploy to K3s (starts with 2 replicas - default HA)
@@ -86,7 +106,7 @@ sudo k3s kubectl get pods -n iot-edge
 
 ---
 
-## Step 3: Start Device Simulator (30 seconds)
+## Step 4: Start Device Simulator (30 seconds)
 
 ```bash
 cd ../simulator
@@ -102,7 +122,7 @@ Published 30 readings in 0.05s (Total: 30)
 
 ---
 
-## Step 4: Verify Data Flow
+## Step 5: Verify Data Flow
 
 ```bash
 # Check logs
@@ -116,20 +136,41 @@ curl -X POST "http://localhost:31086/api/v2/query?org=iot-org" \
   -d '{"query": "from(bucket:\"sensor-data\") |> range(start:-5m) |> limit(n:5)"}'
 ```
 
-If you see data, **congratulations!** 🎉
+If you see data in InfluxDB, **the edge pipeline is working!**
+
+### Verify Cloud Pipeline
+
+```bash
+# Check cloud-uplink is sending data
+sudo k3s kubectl logs -f deployment/cloud-uplink -n iot-edge
+
+# Check cloud Cassandra has data (wait 30s)
+curl http://localhost:8000/api/v1/devices
+curl http://localhost:8000/api/v1/devices/device_0000/latest
+```
+
+If the Cloud API returns device data, **the full edge-to-cloud pipeline is working!** 🎉
 
 ---
 
 ## Accessing Services
 
-All services exposed via NodePort:
+### Edge (K3s NodePort)
 
 | Service | URL | Credentials |
 |---------|-----|-------------|
 | **EMQX Dashboard** | http://localhost:31803 | admin / public |
 | **InfluxDB UI** | http://localhost:31086 | admin / adminpassword |
-| **Device Registry API** | http://localhost:31080/docs | - |
-| **Redpanda Admin** | http://localhost:31964 | - |
+| **Device Registry API** | http://localhost:31080/docs | — |
+| **Redpanda Admin** | http://localhost:31964 | — |
+
+### Cloud (Docker Compose)
+
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| **Cloud API (Swagger)** | http://localhost:8000/docs | — |
+| **MinIO Console** | http://localhost:9001 | minioadmin / minioadmin |
+| **Cloud Redpanda Admin** | http://localhost:29644 | — |
 
 ---
 
@@ -226,16 +267,23 @@ cd edge
 ./k3s-undeploy.sh
 ```
 
+### Stop Cloud Services
+```bash
+cd cloud
+./stop-cloud.sh
+# To also remove data: docker-compose down -v
+```
+
 ### Stop K3s Completely
 ```bash
 sudo systemctl stop k3s
 ```
 
-### Restart K3s
+### Restart Everything
 ```bash
-sudo systemctl start k3s
-cd edge
-./k3s-deploy.sh
+cd cloud && ./start-cloud.sh
+cd ../edge && ./k3s-deploy.sh
+cd ../simulator && ./run-simulator.sh
 ```
 
 ---
@@ -324,16 +372,21 @@ EMQX Broker (port 31883)
     ↓
 Ingestion Service (shared subscription)
     ↓
-Redpanda (Kafka)
+Edge Redpanda (raw-sensor-data)
     ↓
-Transformation Service (filters, aggregates)
+Transformation Service
     ↓
-Redpanda (transformed topic)
-    ↓
-InfluxDB Writer → InfluxDB (node-local persistence)
+Edge Redpanda (transformed-sensor-data)
+    ├──→ InfluxDB Writer → InfluxDB (7-day local)
+    └──→ Cloud Uplink ───→ Cloud Redpanda (edge-sensor-data)
+                              ↓
+                           Cassandra Writer → Cassandra (90-day cloud)
+                              ↑
+                           Cloud API (REST queries)
+                           Spark Job (batch ML training) → MinIO (models)
 ```
 
-### Components
+### Edge Components (K3s)
 
 | Component | Type | Replicas | Purpose |
 |-----------|------|----------|---------|
@@ -343,7 +396,19 @@ InfluxDB Writer → InfluxDB (node-local persistence)
 | **Ingestion** | Deployment + HPA | 2-30 | MQTT → Redpanda |
 | **Transformation** | Deployment + HPA | 2-30 | Data processing |
 | **InfluxDB Writer** | Deployment + HPA | 2-10 | Redpanda → InfluxDB |
+| **Cloud Uplink** | Deployment + HPA | 1-5 | Edge Redpanda → Cloud Redpanda |
 | **Device Registry** | Deployment | 2 | Device management API |
+
+### Cloud Components (Docker Compose)
+
+| Component | Description |
+|-----------|-------------|
+| **Redpanda** | Cloud message bus (receives edge data) |
+| **Cassandra** | Long-term time-series storage (90 days) |
+| **MinIO** | S3-compatible data lake (ML models) |
+| **Cassandra Writer** | Cloud Redpanda → Cassandra |
+| **Cloud API** | REST API for historical queries |
+| **Spark Job** | On-demand batch analytics + ML training |
 
 ### Fault Tolerance & Load Sharing
 
@@ -351,7 +416,7 @@ InfluxDB Writer → InfluxDB (node-local persistence)
 - **Redpanda**: 10 partitions per topic, device_id key → ordering per device
 - **InfluxDB**: Node-local, accepts 1-min data loss on node failure
 - **Python Services**: Auto-scaling, stateless, PodDisruptionBudgets
-- **Startup**: Init containers ensure services wait for dependencies (EMQX, Redpanda topics, InfluxDB)
+- **Startup**: Infra script deploys brokers first, services script waits for readiness
 - **Topics**: Auto-creation disabled; init job creates topics with 10 partitions before services start
 
 ---

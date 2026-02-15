@@ -28,3 +28,4 @@ data:
   # Consumer Groups
   CONSUMER_GROUP_TRANSFORMATION: "transformation-service"
   CONSUMER_GROUP_INFLUXDB: "influxdb-writer"
+  CONSUMER_GROUP_UPLINK: "cloud-uplink"

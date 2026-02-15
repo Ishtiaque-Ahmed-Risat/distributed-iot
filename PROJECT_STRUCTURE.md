@@ -46,9 +46,13 @@ distributed-iot/
 │   │   │   ├── deployment.yaml   # Deployment
 │   │   │   ├── hpa.yaml          # HPA (1-30 replicas)
 │   │   │   └── pdb.yaml          # Pod disruption budget
-│   │   └── influxdb-writer/      # InfluxDB Writer
+│   │   ├── influxdb-writer/      # InfluxDB Writer
+│   │   │   ├── deployment.yaml   # Deployment
+│   │   │   ├── hpa.yaml          # HPA (1-10 replicas)
+│   │   │   └── pdb.yaml          # Pod disruption budget
+│   │   └── cloud-uplink/         # Edge → Cloud Bridge
 │   │       ├── deployment.yaml   # Deployment
-│   │       ├── hpa.yaml          # HPA (1-10 replicas)
+│   │       ├── hpa.yaml          # HPA (1-5 replicas)
 │   │       └── pdb.yaml          # Pod disruption budget
 │   │
 │   ├── services/                  # Service source code
@@ -67,13 +71,17 @@ distributed-iot/
 │   │   │   ├── requirements.txt
 │   │   │   ├── Dockerfile
 │   │   │   └── README.md
-│   │   └── device-registry/      # Device Registry (Python/FastAPI)
-│   │       ├── main.py           # REST API for device metadata
+│   │   ├── device-registry/      # Device Registry (Python/FastAPI)
+│   │   │   ├── main.py           # REST API for device metadata
+│   │   │   ├── requirements.txt
+│   │   │   ├── Dockerfile
+│   │   │   ├── README.md
+│   │   │   ├── QUICKSTART.md
+│   │   │   └── test_api.py
+│   │   └── cloud-uplink/         # Edge → Cloud Bridge (Python)
+│   │       ├── main.py           # Edge Redpanda → Cloud Redpanda
 │   │       ├── requirements.txt
-│   │       ├── Dockerfile
-│   │       ├── README.md
-│   │       ├── QUICKSTART.md
-│   │       └── test_api.py
+│   │       └── Dockerfile
 │   │
 │   ├── k3s-build-images.sh        # Build and import images to K3s
 │   ├── k3s-deploy.sh              # Deploy all services
@@ -83,14 +91,30 @@ distributed-iot/
 │   ├── local-mode.sh              # Scale to single node
 │   └── README.md                  # Edge documentation
 │
-├── cloud/                         # Cloud Services (Phase 3)
-│   └── README.md                  # Cloud documentation (planned)
+├── cloud/                         # Cloud Services (Docker Compose)
+│   ├── docker-compose.yml         # Infrastructure + services
+│   ├── docker-compose.job.yml     # ML training job (on-demand)
+│   ├── start-cloud.sh             # Start cloud services
+│   ├── stop-cloud.sh              # Stop cloud services
+│   ├── init/                      # Init scripts and schemas
+│   │   └── cassandra-schema.cql   # Cassandra table definitions
+│   ├── services/                  # Cloud service source code
+│   │   ├── cassandra-writer/      # Redpanda → Cassandra writer
+│   │   │   ├── main.py
+│   │   │   ├── Dockerfile
+│   │   │   └── requirements.txt
+│   │   ├── cloud-api/             # REST API (FastAPI)
+│   │   │   ├── main.py
+│   │   │   ├── Dockerfile
+│   │   │   └── requirements.txt
+│   │   └── spark-job/             # Batch analytics + ML training
+│   │       ├── main.py
+│   │       ├── Dockerfile
+│   │       └── requirements.txt
+│   └── README.md                  # Cloud documentation
 │
 └── docs/                          # Documentation
-    ├── architecture.png           # System architecture diagram
-    ├── DATA_TRANSFORMATION.md     # Transformation layer details
-    ├── LLM_INTEGRATION.md         # LLM extensibility architecture
-    └── TRANSFORMATION_SUMMARY.md  # Transformation summary
+    └── architecture.png           # System architecture diagram
 ```
 
 ## Component Overview
@@ -153,35 +177,67 @@ distributed-iot/
 - Consumer group-based load balancing
 - Auto-scales: 1-10 replicas (HPA)
 
-### Cloud (Phase 3 - Planned)
-- Cloud uplink service (InfluxDB → Cloud Redpanda)
-- Cassandra for long-term storage
-- MinIO data lake
-- Spark for batch analytics
-- ML training pipeline
+**Cloud Uplink** (Python)
+- Bridges edge Redpanda → cloud Redpanda
+- Preserves per-device ordering via partition key
+- Manual commit after successful cloud write
+- Auto-scales: 1-5 replicas (HPA)
+
+### Cloud (Docker Compose)
+
+**Cloud Redpanda**
+- Receives uplinked data from edge
+- Topic: `edge-sensor-data` (10 partitions)
+- 24-hour retention
+
+**Cassandra**
+- Time-bucketed schema: `PRIMARY KEY ((device_id, date), timestamp DESC)`
+- 90-day TTL with TimeWindowCompactionStrategy
+- Fast per-device range queries for ML training
+
+**Cassandra Writer** (Python)
+- Consumes from cloud Redpanda → writes to Cassandra
+- Unlogged batches grouped by partition key for efficiency
+- Also maintains `device_latest` table
+
+**Cloud API** (FastAPI)
+- REST endpoints for historical queries
+- Swagger UI at `/docs`
+- Device readings, latest values, stats, export
+
+**Spark Job** (Python, on-demand)
+- Batch analytics + ML model training (IsolationForest)
+- Reads from Cassandra, saves models to MinIO
+- Run with: `docker-compose -f docker-compose.yml -f docker-compose.job.yml run spark-job`
+
+**MinIO** (S3-compatible)
+- Stores trained ML model artifacts
+- Used by Spark job for model persistence
 
 ## Data Flow
 
 ```
+EDGE (K3s)                                   CLOUD (Docker Compose)
+
 IoT Devices (Simulator)
     ↓ MQTT (QoS 1, port 31883)
-EMQX Broker (StatefulSet, Clustered)
-    ↓ Shared Subscription ($share/ingestion-group/...)
-Data Ingestion Service (Deployment, HPA 1-30)
-    ↓ Idempotent Producer (acks=1, ordering preserved)
-Redpanda Topic: raw-sensor-data (30 partitions)
+EMQX Broker (StatefulSet)
+    ↓ Shared Subscription
+Ingestion Service (HPA 2-30)
+    ↓ key=device_id
+Edge Redpanda: raw-sensor-data (10 partitions)
     ↓ Consumer Group
-Transformation Service (Deployment, HPA 1-30)
+Transformation Service (HPA 2-30)
     ↓ Unit conversion, normalization
-Redpanda Topic: transformed-sensor-data
-    ↓ Consumer Group
-InfluxDB Writer (Deployment, HPA 1-10)
-    ↓ Batched writes
-InfluxDB (DaemonSet, node-local storage)
-    ↓ 7-day retention
-Edge ML Inference (Phase 2)
-    ↓ Cloud Uplink (Phase 3)
-Cloud Infrastructure (Cassandra, MinIO, Spark)
+Edge Redpanda: transformed-sensor-data
+    ├──→ InfluxDB Writer (HPA 2-10)       Cloud Uplink (HPA 1-5)
+    │       ↓ Batched writes                    ↓ key=device_id preserved
+    │    InfluxDB (7-day local)            Cloud Redpanda: edge-sensor-data
+    │                                           ↓
+    │                                      Cassandra Writer → Cassandra (90-day)
+    │                                           ↑
+    │                                      Cloud API (FastAPI)
+    │                                      Spark Job → MinIO (models)
 ```
 
 ## Scaling Model
@@ -213,31 +269,40 @@ Cloud Infrastructure (Cassandra, MinIO, Spark)
 ## Development Phases
 
 - **Phase 1** (Complete): K3s edge gateway with auto-scaling ✅
-- **Phase 2** (Planned): Edge ML inference for anomaly detection
-- **Phase 3** (Planned): Cloud integration and batch analytics
+- **Phase 2** (Complete): Cloud integration (Redpanda, Cassandra, API, Spark) ✅
+- **Phase 3** (Planned): Edge ML inference for real-time anomaly detection
 
 ## Quick Commands
 
 ```bash
-# Deploy
+# Start cloud
+cd cloud && ./start-cloud.sh
+
+# Deploy edge
 cd edge && ./k3s-build-images.sh && ./k3s-deploy.sh
 
 # Run simulator
 cd simulator && ./run-simulator.sh
 
+# Monitor edge
+sudo k3s kubectl get pods -n iot-edge --watch
+sudo k3s kubectl get hpa -n iot-edge
+
+# Monitor cloud
+docker-compose -f cloud/docker-compose.yml logs -f cassandra-writer
+
+# Query cloud API
+curl http://localhost:8000/api/v1/devices
+
+# Run ML training
+cd cloud && docker-compose -f docker-compose.yml -f docker-compose.job.yml run spark-job
+
 # Scale to demo mode
 cd edge && ./demo-mode.sh
 
-# Monitor
-sudo k3s kubectl get pods -n iot-edge --watch
-sudo k3s kubectl get hpa -n iot-edge
-sudo k3s kubectl logs -f deployment/ingestion-service -n iot-edge
-
-# Scale back
-cd edge && ./local-mode.sh
-
 # Undeploy
 cd edge && ./k3s-undeploy.sh
+cd cloud && ./stop-cloud.sh
 ```
 
 ## Documentation

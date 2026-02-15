@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Deploy application services: Device Registry, Ingestion, Transformation, InfluxDB Writer
+# Deploy application services: Device Registry, Ingestion, Transformation, InfluxDB Writer, Cloud Uplink
 # Run this AFTER k3s-deploy-infra.sh and all infrastructure pods are Running.
 #
 
@@ -38,20 +38,24 @@ fi
 echo ""
 
 # Deploy services
-echo -e "${YELLOW}[1/4] Device Registry...${NC}"
+echo -e "${YELLOW}[1/5] Device Registry...${NC}"
 sudo k3s kubectl apply -f k3s/device-registry/
 echo -e "${GREEN}✓ Deployed${NC}"
 
-echo -e "${YELLOW}[2/4] Ingestion Service...${NC}"
+echo -e "${YELLOW}[2/5] Ingestion Service...${NC}"
 sudo k3s kubectl apply -f k3s/ingestion-service/
 echo -e "${GREEN}✓ Deployed${NC}"
 
-echo -e "${YELLOW}[3/4] Transformation Service...${NC}"
+echo -e "${YELLOW}[3/5] Transformation Service...${NC}"
 sudo k3s kubectl apply -f k3s/transformation-service/
 echo -e "${GREEN}✓ Deployed${NC}"
 
-echo -e "${YELLOW}[4/4] InfluxDB Writer...${NC}"
+echo -e "${YELLOW}[4/5] InfluxDB Writer...${NC}"
 sudo k3s kubectl apply -f k3s/influxdb-writer/
+echo -e "${GREEN}✓ Deployed${NC}"
+
+echo -e "${YELLOW}[5/5] Cloud Uplink...${NC}"
+sudo k3s kubectl apply -f k3s/cloud-uplink/
 echo -e "${GREEN}✓ Deployed${NC}"
 
 echo ""
@@ -70,6 +74,7 @@ echo "  EMQX Dashboard:  http://localhost:31803  (admin/public)"
 echo "  InfluxDB UI:     http://localhost:31086  (admin/adminpassword)"
 echo "  Device Registry: http://localhost:31080/docs"
 echo "  Redpanda Admin:  http://localhost:31964"
+echo "  Cloud API:       http://localhost:8000/docs (when cloud is running)"
 echo ""
 echo "HPA Status:"
 sudo k3s kubectl get hpa -n iot-edge 2>/dev/null || echo "  (no HPA found)"

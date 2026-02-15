@@ -1,0 +1,24 @@
+version: '3.8'
+
+# ============================================
+# On-demand ML Training / Batch Analytics Job
+# ============================================
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.job.yml run spark-job
+# ============================================
+
+services:
+  spark-job:
+    image: spark-job:latest
+    build:
+      context: ./services/spark-job
+      dockerfile: Dockerfile
+    container_name: cloud-spark-job
+    environment:
+      - CASSANDRA_HOSTS=cassandra
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MODEL_BUCKET=iot-models
+      - HOURS_BACK=24
+    networks:
+      - cloud-network

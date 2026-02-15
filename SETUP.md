@@ -32,7 +32,7 @@ Complete setup guide for the distributed IoT gateway system on K3s.
 curl -sfL https://get.k3s.io | sh -
 
 # Verify installation
-sudo k3s sudo k3s kubectl get nodes
+sudo k3s kubectl get nodes
 ```
 
 **Expected output:**
@@ -100,17 +100,29 @@ cd edge
 
 **Expected deployment time:** 2-3 minutes
 
+### Deploy Cloud Services
+
+```bash
+cd cloud
+./start-cloud.sh
+```
+
+This starts Redpanda, Cassandra, MinIO, Cassandra Writer, and Cloud API via Docker Compose.
+
 ### Verify Deployment
 
 ```bash
-# All pods should be Running
+# Edge pods should all be Running
 sudo k3s kubectl get pods -n iot-edge
 
-# Check services
+# Check edge services
 sudo k3s kubectl get svc -n iot-edge
 
 # Check HPAs (auto-scaling)
 sudo k3s kubectl get hpa -n iot-edge
+
+# Cloud services should be running
+docker-compose -f cloud/docker-compose.yml ps
 ```
 
 ---
@@ -165,6 +177,15 @@ All services are exposed via NodePort:
 | **InfluxDB UI** | http://influxdb:8086 | http://localhost:31086 | admin / adminpassword |
 | **Device Registry** | http://device-registry:8080 | http://localhost:31080/docs | - |
 | **Redpanda Admin** | http://redpanda:9644 | http://localhost:31964 | - |
+
+**Cloud Services (Docker Compose):**
+
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| **Cloud API** | http://localhost:8000/docs | - |
+| **MinIO Console** | http://localhost:9001 | minioadmin / minioadmin |
+| **Cloud Redpanda Admin** | http://localhost:29644 | - |
+| **Cassandra CQL** | localhost:9042 | - |
 
 **For remote access**, replace `localhost` with your K3s node IP address.
 
@@ -258,9 +279,9 @@ cd edge
 
 **Capacity:** 100K+ devices, 1M+ msg/sec
 
-### Local Mode (Single Node)
+### Local Mode (Default HA)
 
-For local development, scale back to 1 replica:
+For local development, scale back to defaults:
 
 ```bash
 cd edge
@@ -268,10 +289,10 @@ cd edge
 ```
 
 **What it does:**
-- Scales EMQX to 1 replica
+- Scales EMQX to 2 replicas (default HA)
 - Scales Redpanda to 1 replica (replication factor=1)
 - Reduces resource usage for local machine
-- Python services auto-scale (1-30 replicas)
+- Python services auto-scale (2-30 replicas)
 
 **Capacity:** 10K+ devices, 100K+ msg/sec
 
@@ -285,9 +306,10 @@ sudo k3s kubectl get hpa -n iot-edge
 
 # Expected output:
 # NAME                          REFERENCE                        TARGETS    MINPODS   MAXPODS   REPLICAS
-# ingestion-service-hpa         Deployment/ingestion-service     45%/70%    1         30        2
-# transformation-service-hpa    Deployment/transformation-service 30%/70%   1         30        1
-# influxdb-writer-hpa           Deployment/influxdb-writer        20%/70%   1         10        1
+# ingestion-service-hpa         Deployment/ingestion-service     45%/70%    2         30        2
+# transformation-service-hpa    Deployment/transformation-service 30%/70%   2         30        2
+# influxdb-writer-hpa           Deployment/influxdb-writer        20%/70%   2         10        2
+# cloud-uplink-hpa              Deployment/cloud-uplink           15%/70%   1          5        1
 ```
 
 **Scaling triggers:**

@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""
+Cassandra Writer Service
+Cloud Redpanda → Cassandra data pipeline
+Consumes sensor data from cloud Redpanda and writes to Cassandra
+with time-bucketed partitioning for fast reads.
+"""
+
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Dict, Any, List
+from kafka import KafkaConsumer
+from cassandra.cluster import Cluster
+from cassandra.policies import DCAwareRoundRobinPolicy
+from cassandra.query import BatchStatement, BatchType, ConsistencyLevel
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class CassandraWriterService:
+    """Consumes from cloud Redpanda and writes to Cassandra"""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.consumer = None
+        self.cassandra_cluster = None
+        self.session = None
+        self.insert_reading_stmt = None
+        self.update_latest_stmt = None
+        self.write_count = 0
+        self.running = False
+        self.last_flush_time = time.time()
+        self.buffer: List[Dict[str, Any]] = []
+
+    def setup_cassandra(self):
+        """Initialize Cassandra connection and prepared statements"""
+        try:
+            hosts = self.config['cassandra_hosts']
+            self.cassandra_cluster = Cluster(
+                hosts,
+                load_balancing_policy=DCAwareRoundRobinPolicy(local_dc='DC1'),
+                protocol_version=4
+            )
+            self.session = self.cassandra_cluster.connect('iot_data')
+            logger.info(f"✓ Connected to Cassandra: {hosts}")
+
+            # Prepare statements for performance
+            self.insert_reading_stmt = self.session.prepare("""
+                INSERT INTO sensor_readings
+                    (device_id, date, timestamp, sensor_type, value, unit,
+                     original_value, original_unit, is_anomaly, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """)
+            self.insert_reading_stmt.consistency_level = ConsistencyLevel.LOCAL_ONE
+
+            self.update_latest_stmt = self.session.prepare("""
+                INSERT INTO device_latest
+                    (device_id, sensor_type, timestamp, value, unit, is_anomaly)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """)
+            self.update_latest_stmt.consistency_level = ConsistencyLevel.LOCAL_ONE
+
+            logger.info("✓ Prepared statements ready")
+
+        except Exception as e:
+            logger.error(f"Failed to connect to Cassandra: {e}")
+            raise
+
+    def setup_kafka(self):
+        """Initialize Kafka consumer for cloud Redpanda"""
+        try:
+            self.consumer = KafkaConsumer(
+                self.config['topic'],
+                bootstrap_servers=self.config['redpanda_brokers'],
+                group_id=self.config['consumer_group'],
+                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                auto_offset_reset='earliest',
+                enable_auto_commit=False,  # Manual commit after write
+                max_poll_records=self.config['batch_size']
+            )
+            logger.info(f"✓ Connected to cloud Redpanda: {self.config['redpanda_brokers']}")
+            logger.info(f"  Consuming from: {self.config['topic']}")
+        except Exception as e:
+            logger.error(f"Failed to connect to Redpanda: {e}")
+            raise
+
+    def write_batch(self, records: List[Dict[str, Any]]):
+        """Write a batch of records to Cassandra using unlogged batch per partition"""
+        if not records:
+            return
+
+        # Group records by partition key (device_id, date) for efficient batching
+        partitions: Dict[tuple, list] = {}
+        for record in records:
+            ts = datetime.fromtimestamp(record['timestamp'], tz=timezone.utc)
+            date_str = ts.strftime('%Y-%m-%d')
+            key = (record['device_id'], date_str)
+            if key not in partitions:
+                partitions[key] = []
+            partitions[key].append((record, ts, date_str))
+
+        # Write each partition group as an unlogged batch (single partition = efficient)
+        for (device_id, date_str), group in partitions.items():
+            batch = BatchStatement(batch_type=BatchType.UNLOGGED)
+
+            for record, ts, ds in group:
+                metadata_map = {}
+                if record.get('metadata') and isinstance(record['metadata'], dict):
+                    metadata_map = {str(k): str(v) for k, v in record['metadata'].items()}
+
+                batch.add(self.insert_reading_stmt, (
+                    record['device_id'],
+                    ds,
+                    ts,
+                    record.get('sensor_type', 'unknown'),
+                    float(record.get('value', 0)),
+                    record.get('unit', ''),
+                    float(record.get('original_value', record.get('value', 0))),
+                    record.get('original_unit', record.get('unit', '')),
+                    bool(record.get('is_anomaly', False)),
+                    metadata_map
+                ))
+
+                # Also update latest reading
+                batch.add(self.update_latest_stmt, (
+                    record['device_id'],
+                    record.get('sensor_type', 'unknown'),
+                    ts,
+                    float(record.get('value', 0)),
+                    record.get('unit', ''),
+                    bool(record.get('is_anomaly', False))
+                ))
+
+            try:
+                self.session.execute(batch)
+            except Exception as e:
+                logger.error(f"Failed to write batch for {device_id}/{date_str}: {e}")
+                # Try individual writes as fallback
+                for record, ts, ds in group:
+                    try:
+                        metadata_map = {}
+                        if record.get('metadata') and isinstance(record['metadata'], dict):
+                            metadata_map = {str(k): str(v) for k, v in record['metadata'].items()}
+
+                        self.session.execute(self.insert_reading_stmt, (
+                            record['device_id'], ds, ts,
+                            record.get('sensor_type', 'unknown'),
+                            float(record.get('value', 0)),
+                            record.get('unit', ''),
+                            float(record.get('original_value', record.get('value', 0))),
+                            record.get('original_unit', record.get('unit', '')),
+                            bool(record.get('is_anomaly', False)),
+                            metadata_map
+                        ))
+                    except Exception as inner_e:
+                        logger.error(f"Individual write failed: {inner_e}")
+
+        self.write_count += len(records)
+
+    def start(self):
+        """Start the writer service"""
+        logger.info("=" * 50)
+        logger.info("Cassandra Writer Service")
+        logger.info("=" * 50)
+        logger.info(f"[CONFIG] Redpanda Brokers: {self.config['redpanda_brokers']}")
+        logger.info(f"[CONFIG] Topic: {self.config['topic']}")
+        logger.info(f"[CONFIG] Cassandra Hosts: {self.config['cassandra_hosts']}")
+        logger.info(f"[CONFIG] Batch Size: {self.config['batch_size']}")
+        logger.info(f"[CONFIG] Flush Interval: {self.config['flush_interval']}s")
+
+        self.setup_cassandra()
+        self.setup_kafka()
+
+        self.running = True
+        logger.info("Cassandra Writer Service started successfully")
+
+        try:
+            while self.running:
+                records = self.consumer.poll(
+                    timeout_ms=1000,
+                    max_records=self.config['batch_size']
+                )
+
+                # Flatten messages
+                messages = []
+                for tp, msgs in records.items():
+                    for msg in msgs:
+                        messages.append(msg.value)
+
+                if messages:
+                    self.buffer.extend(messages)
+
+                # Flush if buffer full or time elapsed
+                now = time.time()
+                buffer_full = len(self.buffer) >= self.config['batch_size']
+                time_elapsed = (now - self.last_flush_time) >= self.config['flush_interval']
+
+                if self.buffer and (buffer_full or time_elapsed):
+                    self.write_batch(self.buffer)
+                    self.consumer.commit()
+                    logger.info(
+                        f"[INFO] Wrote {len(self.buffer)} records to Cassandra "
+                        f"(Total: {self.write_count})"
+                    )
+                    self.buffer.clear()
+                    self.last_flush_time = now
+
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt")
+        finally:
+            self.stop()
+
+    def stop(self):
+        """Stop the writer service"""
+        logger.info("Shutting down Cassandra Writer Service...")
+        self.running = False
+
+        # Flush remaining
+        if self.buffer:
+            self.write_batch(self.buffer)
+            self.buffer.clear()
+
+        if self.consumer:
+            self.consumer.close()
+        if self.cassandra_cluster:
+            self.cassandra_cluster.shutdown()
+
+        logger.info(f"Total records written: {self.write_count}")
+        logger.info("Service stopped")
+
+
+def signal_handler(signum, frame):
+    logger.info(f"Received signal {signum}")
+    sys.exit(0)
+
+
+def main():
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    config = {
+        'redpanda_brokers': os.getenv('REDPANDA_BROKERS', 'redpanda:9092').split(','),
+        'topic': os.getenv('REDPANDA_TOPIC', 'edge-sensor-data'),
+        'consumer_group': os.getenv('CONSUMER_GROUP', 'cassandra-writer'),
+        'cassandra_hosts': os.getenv('CASSANDRA_HOSTS', 'cassandra').split(','),
+        'batch_size': int(os.getenv('BATCH_SIZE', '500')),
+        'flush_interval': int(os.getenv('FLUSH_INTERVAL', '5')),
+    }
+
+    service = CassandraWriterService(config)
+
+    try:
+        service.start()
+    except Exception as e:
+        logger.error(f"Service failed: {e}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

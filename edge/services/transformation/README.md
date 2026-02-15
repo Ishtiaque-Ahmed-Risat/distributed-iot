@@ -3,7 +3,7 @@
 Transforms raw sensor data with unit conversion and semantic normalization. LLM-extensible for future semantic understanding.
 
 **Language**: Python  
-**Framework**: kafka-python  
+**Framework**: kafka-python
 **Deployment**: K3s Deployment with HPA (1-30 replicas)
 
 ## Functionality

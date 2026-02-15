@@ -1,0 +1,59 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-uplink
+  namespace: iot-edge
+  labels:
+    app: cloud-uplink
+    component: data-pipeline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloud-uplink
+  template:
+    metadata:
+      labels:
+        app: cloud-uplink
+        component: data-pipeline
+    spec:
+      containers:
+      - name: cloud-uplink
+        image: cloud-uplink:latest
+        imagePullPolicy: Never
+        env:
+        # Edge Redpanda (internal K3s service)
+        - name: EDGE_REDPANDA_BROKERS
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: REDPANDA_BROKERS
+        - name: EDGE_REDPANDA_TOPIC
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: REDPANDA_TOPIC_TRANSFORMED
+        - name: CONSUMER_GROUP
+          value: "cloud-uplink"
+        # Cloud Redpanda (host machine, accessible via node IP)
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: CLOUD_REDPANDA_BROKERS
+          value: "$(HOST_IP):29092"
+        - name: CLOUD_REDPANDA_TOPIC
+          value: "edge-sensor-data"
+        # Tuning
+        - name: UPLINK_BATCH_SIZE
+          value: "500"
+        - name: POLL_INTERVAL_MS
+          value: "1000"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"

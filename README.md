@@ -6,83 +6,68 @@ A distributed IoT system with edge processing, real-time ML inference, and cloud
 ![System Architecture](docs/architecture.png)
 
 ```
-IoT Devices → Device Registry (descriptions) 
-           → EMQX → Ingestion → Redpanda(raw)
-           → Transformation Service (unit conversion, semantic normalization)
-           → Redpanda(transformed) → InfluxDB
-           → Cloud (Cassandra, MinIO, Spark)
+EDGE (K3s)                              CLOUD (Docker Compose)
+
+IoT Devices → EMQX → Ingestion          Cloud Uplink
+    → Redpanda(raw)                         ↓
+    → Transformation                     Cloud Redpanda
+    → Redpanda(transformed)                 ↓
+    ├→ InfluxDB Writer → InfluxDB        Cassandra Writer → Cassandra
+    └→ Cloud Uplink ──────────────→      Cloud API (FastAPI)
+                                         Spark Job → MinIO (ML models)
 ```
 
-**Key Feature**: Data Transformation Layer with LLM extensibility for semantic understanding.
-
-## Project Structure
-
-```
-iot_system/
-├── edge/               # Edge gateway services and infrastructure
-├── cloud/              # Cloud services and infrastructure
-├── simulator/          # IoT device simulator
-├── shared/             # Shared libraries and configurations
-└── docs/               # Documentation
-```
+**Key Features**: Fault-tolerant edge gateway, per-device data ordering, cloud analytics pipeline.
 
 ## Quick Start
 
 See [QUICKSTART.md](QUICKSTART.md) for detailed instructions.
 
-### 1. Install K3s
 ```bash
-curl -sfL https://get.k3s.io | sh -
-```
+# 1. Start cloud infrastructure
+cd cloud && ./start-cloud.sh
 
-### 2. Deploy Edge Gateway
-```bash
-cd edge
-./k3s-build-images.sh
-./k3s-deploy.sh
-```
+# 2. Build & deploy edge
+cd edge && ./k3s-build-images.sh && ./k3s-deploy.sh
 
-### 3. Start Simulator
-```bash
-cd simulator
-./run-simulator.sh
+# 3. Run simulator
+cd simulator && ./run-simulator.sh
 ```
 
 ## Tech Stack
 
-**Edge:**
-- EMQX (MQTT Broker)
-- Device Registry (Python FastAPI) - REST API for device descriptions
-- Data Ingestion Service (Python)
-- **Data Transformation Service (Python)** - Unit conversion & semantic normalization
-- Redpanda (Message Queue - raw & transformed topics)
-- InfluxDB (Time-series Buffer - 7 days)
-- InfluxDB Writer Service (Python)
-- ML Inference Service (Python) - Phase 2
-- K3s (Orchestration)
+**Edge (K3s):**
+- EMQX (MQTT Broker - StatefulSet, clustered)
+- Redpanda (Message Queue - StatefulSet)
+- InfluxDB (Time-series Buffer - DaemonSet, 7-day retention)
+- Ingestion Service (Python, HPA)
+- Transformation Service (Python, HPA)
+- InfluxDB Writer (Python, HPA)
+- Cloud Uplink (Python, HPA)
+- Device Registry (Python FastAPI)
 
-**Cloud:**
+**Cloud (Docker Compose):**
 - Redpanda (Message Bus)
-- Cassandra (Time-series DB)
-- MinIO (Data Lake)
-- Spark (Batch Analytics)
-- Go (API Gateway, Services)
-- Python (ML Training)
-- Kubernetes (Orchestration)
+- Cassandra (Time-series DB, 90-day retention)
+- MinIO (S3-compatible Data Lake)
+- Cassandra Writer (Python)
+- Cloud API (Python FastAPI)
+- Spark Job (Python ML training)
 
 ## Development Phases
 
-- **Phase 1** (Weeks 1-2): Basic edge gateway with MQTT and storage
-- **Phase 2** (Weeks 3-4): Edge processing with ML inference
-- **Phase 3** (Weeks 5-6): Cloud integration and analytics
+- **Phase 1** ✅ K3s edge gateway with MQTT, streaming, and auto-scaling
+- **Phase 2** ✅ Cloud integration (Redpanda, Cassandra, API, Spark)
+- **Phase 3** (Planned): Edge ML inference for real-time anomaly detection
 
 ## Requirements
 
 - **K3s** (lightweight Kubernetes for edge)
-- **Docker** (for building images)
-- **Python 3.11+** (for services and simulator)
-- **Kubernetes** (optional, for cloud deployment)
+- **Docker** and **docker-compose** (for building images and cloud services)
+- **Python 3.11+** (for simulator)
 
 ## Documentation
 
-See `docs/` for detailed architecture and API documentation.
+- [QUICKSTART.md](QUICKSTART.md) - Setup and deployment guide
+- [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) - Detailed project structure
+- See `docs/` for architecture diagrams
