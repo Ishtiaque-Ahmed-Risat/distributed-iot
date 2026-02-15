@@ -1,61 +1,50 @@
-# Cloud Services
+# Cloud Infrastructure
 
-Cloud infrastructure for IoT data storage, analytics, and ML training.
+Cloud services for batch analytics, ML training, and long-term storage. **Note**: Cloud infrastructure is not yet implemented for K3s deployment.
 
-## Current Phase (Phase 1)
-
-Basic cloud infrastructure:
-- **Redpanda**: Central message bus
-- **Cassandra**: Time-series database
-- **MinIO**: S3-compatible data lake
-
-## Future Phases
-
-Phase 2-3 will add:
-- API Gateway service (Go)
-- Data Writer service (Go)
-- Device Management service (Go)
-- ML Training service (Python)
-- Spark cluster for batch analytics
-
-## Quick Start
-
-```bash
-# Start cloud services
-./start-cloud.sh
-
-# Stop services
-./stop-cloud.sh
-```
-
-## Accessing Services
-
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| MinIO Console | http://localhost:9001 | minioadmin / minioadmin |
-| Redpanda Admin | http://localhost:29644 | - |
-| Cassandra CQL | localhost:9042 | - |
-
-## Service Ports
-
-- **Redpanda**: 29092 (Kafka), 28082 (HTTP), 28081 (Schema Registry)
-- **Cassandra**: 9042 (CQL), 7199 (JMX)
-- **MinIO**: 9000 (API), 9001 (Console)
-
-Note: Cloud ports are offset (+10000) from edge ports to avoid conflicts during development.
-
-## Data Flow (Planned)
+## Planned Architecture
 
 ```
-Edge Gateway → Cloud Redpanda → Data Writer → Cassandra + MinIO
-                                            → Spark (batch analytics)
-                                            → ML Training
+Edge Gateway (K3s)
+      ↓ (Cloud Uplink Service - TODO)
+Cloud Redpanda (Message Bus)
+      ↓
+Cassandra (Long-term Time-series Storage)
+MinIO (Data Lake for raw data)
+Spark (Batch Analytics)
+ML Training Pipeline (Cloud-based model updates)
 ```
 
-## Development
+## Components (Planned)
 
-Services are containerized separately and will be added incrementally:
-- `services/api-gateway/` (Phase 2)
-- `services/data-writer/` (Phase 2)
-- `services/ml-training/` (Phase 3)
-- `services/spark/` (Phase 3)
+### Infrastructure
+- **Redpanda**: Central message bus for all edge gateways
+- **Cassandra**: Distributed time-series database
+- **MinIO**: S3-compatible data lake for raw sensor data
+- **Spark**: Batch processing for historical analytics
+
+### Services
+- **Cloud Uplink**: Periodic sync from edge InfluxDB to cloud (every 1 minute)
+- **API Gateway**: REST API for querying historical data
+- **ML Training**: Train models on aggregated data, push to edge
+- **Analytics Dashboard**: Grafana-based visualization
+
+## Current Status
+
+**Phase 1 (Completed)**: Edge gateway with K3s deployment ✅  
+**Phase 2 (TODO)**: Cloud infrastructure deployment  
+**Phase 3 (TODO)**: Edge-cloud integration and ML pipeline
+
+## Future Implementation
+
+Cloud services will be deployed on:
+- **Kubernetes** (for production cloud deployment)
+- **K3s** (for local testing and development)
+
+Deployment manifests will be created in `cloud/k8s/` directory.
+
+## See Also
+
+- [Edge Gateway](../edge/README.md) - Currently implemented
+- [Project README](../README.md) - Overall project structure
+- [OPTIMIZATION_SUMMARY.md](../OPTIMIZATION_SUMMARY.md) - Edge architecture decisions

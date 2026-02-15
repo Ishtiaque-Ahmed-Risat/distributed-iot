@@ -28,22 +28,24 @@ iot_system/
 
 ## Quick Start
 
-### 1. Start IoT Device Simulator
+See [QUICKSTART.md](QUICKSTART.md) for detailed instructions.
+
+### 1. Install K3s
+```bash
+curl -sfL https://get.k3s.io | sh -
+```
+
+### 2. Deploy Edge Gateway
+```bash
+cd edge
+./k3s-build-images.sh
+./k3s-deploy.sh
+```
+
+### 3. Start Simulator
 ```bash
 cd simulator
 ./run-simulator.sh
-```
-
-### 2. Start Edge Gateway
-```bash
-cd edge
-./start-edge.sh
-```
-
-### 3. Start Cloud Services
-```bash
-cd cloud
-./start-cloud.sh
 ```
 
 ## Tech Stack
@@ -76,10 +78,10 @@ cd cloud
 
 ## Requirements
 
-- Docker & Docker Compose
-- Python 3.11+
-- K3s (for edge deployment)
-- Kubernetes (for cloud deployment)
+- **K3s** (lightweight Kubernetes for edge)
+- **Docker** (for building images)
+- **Python 3.11+** (for services and simulator)
+- **Kubernetes** (optional, for cloud deployment)
 
 ## Documentation
 
