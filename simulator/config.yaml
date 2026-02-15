@@ -1,15 +1,15 @@
 # IoT Device Simulator Configuration
 
 mqtt:
-  broker: "localhost"  # Change to edge gateway IP for remote
-  port: 1883
+  broker: "localhost"  # Change to K3s node IP for remote access
+  port: 31883  # K3s NodePort for EMQX
   topic_template: "sensors/{device_id}/data"
   qos: 1  # QoS 1 = at least once delivery
 
 # Device Registry (optional - for registering devices with metadata)
 device_registry:
   enabled: true  # Set to false to skip registration
-  url: "http://localhost:8080"  # Device registry API endpoint
+  url: "http://localhost:31080"  # K3s NodePort for device registry
 
 simulation:
   num_devices: 10  # Start with 10 devices (scale up to 1000+)

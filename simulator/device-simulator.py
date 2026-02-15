@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 IoT Device Simulator
-Simulates multiple IoT sensors sending data via MQTT
+Simulates multiple IoT devices, each with its own MQTT client and thread.
+Each device operates independently — just like real IoT hardware.
 """
 
 import json
 import time
 import random
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, List
 import paho.mqtt.client as mqtt
@@ -23,33 +25,32 @@ logger = logging.getLogger(__name__)
 
 
 class SensorSimulator:
-    """Simulates a single IoT sensor"""
-    
+    """Simulates a single sensor on a device"""
+
     def __init__(self, device_id: str, sensor_type: str, config: Dict):
         self.device_id = device_id
         self.sensor_type = sensor_type
         self.config = config
         self.value = config['initial_value']
-        
+
     def generate_reading(self) -> Dict:
         """Generate sensor reading with optional anomaly"""
-        # Normal variation
         variation = random.uniform(
             self.config['variation_min'],
             self.config['variation_max']
         )
         self.value += variation
-        
+
         # Keep within bounds
-        self.value = max(self.config['min_value'], 
-                        min(self.config['max_value'], self.value))
-        
+        self.value = max(self.config['min_value'],
+                         min(self.config['max_value'], self.value))
+
         # Introduce anomaly occasionally
         is_anomaly = random.random() < self.config.get('anomaly_rate', 0.01)
         if is_anomaly:
             self.value *= random.uniform(1.5, 3.0)
-            logger.warning(f"Anomaly generated for {self.device_id}: {self.value:.2f}")
-        
+            logger.warning(f"Anomaly generated for {self.device_id}/{self.sensor_type}: {self.value:.2f}")
+
         return {
             'device_id': self.device_id,
             'sensor_type': self.sensor_type,
@@ -60,63 +61,131 @@ class SensorSimulator:
         }
 
 
+class DeviceClient:
+    """
+    Represents a single IoT device with its own MQTT client.
+    Each device runs in its own thread, connecting and publishing independently.
+    """
+
+    def __init__(self, device_id: str, mqtt_config: Dict, sensor_configs: Dict, interval: float):
+        self.device_id = device_id
+        self.mqtt_config = mqtt_config
+        self.interval = interval
+        self.sensors: List[SensorSimulator] = []
+        self.mqtt_client: mqtt.Client = None
+        self.running = False
+        self.thread: threading.Thread = None
+        self.message_count = 0
+        self.connected = False
+
+        # Create sensors for this device
+        for sensor_type, sensor_config in sensor_configs.items():
+            self.sensors.append(SensorSimulator(device_id, sensor_type, sensor_config))
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.connected = True
+            logger.info(f"[{self.device_id}] ✓ Connected to MQTT broker")
+        else:
+            self.connected = False
+            logger.error(f"[{self.device_id}] Connection failed (code {rc})")
+
+    def _on_disconnect(self, client, userdata, rc):
+        self.connected = False
+        if rc != 0:
+            logger.warning(f"[{self.device_id}] Unexpected disconnect (code {rc}), reconnecting...")
+        else:
+            logger.info(f"[{self.device_id}] Disconnected cleanly")
+
+    def _setup_mqtt(self):
+        """Create and configure this device's own MQTT client"""
+        self.mqtt_client = mqtt.Client(
+            client_id=self.device_id,
+            clean_session=False
+        )
+        self.mqtt_client.on_connect = self._on_connect
+        self.mqtt_client.on_disconnect = self._on_disconnect
+        self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
+
+        broker = self.mqtt_config['broker']
+        port = self.mqtt_config['port']
+
+        try:
+            self.mqtt_client.connect(broker, port, keepalive=60)
+            self.mqtt_client.loop_start()
+        except Exception as e:
+            logger.error(f"[{self.device_id}] Initial connection failed: {e}, retrying in background...")
+            self.mqtt_client.loop_start()
+
+    def _publish_loop(self):
+        """Main loop: publish all sensor readings at configured interval"""
+        # Stagger startup to avoid thundering herd
+        jitter = random.uniform(0, self.interval)
+        time.sleep(jitter)
+
+        while self.running:
+            start = time.time()
+
+            for sensor in self.sensors:
+                reading = sensor.generate_reading()
+                topic = self.mqtt_config['topic_template'].format(device_id=self.device_id)
+                payload = json.dumps(reading)
+
+                try:
+                    result = self.mqtt_client.publish(
+                        topic, payload, qos=self.mqtt_config.get('qos', 1)
+                    )
+                    if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                        self.message_count += 1
+                    elif result.rc == mqtt.MQTT_ERR_NO_CONN:
+                        logger.warning(f"[{self.device_id}] Not connected — message queued")
+                        self.message_count += 1  # QoS 1 queues it
+                    else:
+                        logger.error(f"[{self.device_id}] Publish failed (rc={result.rc})")
+                except Exception as e:
+                    logger.error(f"[{self.device_id}] Publish error: {e}")
+
+            elapsed = time.time() - start
+            sleep_time = max(0, self.interval - elapsed)
+            time.sleep(sleep_time)
+
+    def start(self):
+        """Start this device's MQTT client and publishing thread"""
+        self._setup_mqtt()
+        self.running = True
+        self.thread = threading.Thread(target=self._publish_loop, daemon=True, name=self.device_id)
+        self.thread.start()
+
+    def stop(self):
+        """Stop this device"""
+        self.running = False
+        if self.mqtt_client:
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+
+
 class IoTDeviceSimulator:
-    """Main simulator managing multiple devices"""
-    
+    """Manages multiple independent device clients"""
+
     def __init__(self, config_file: str = 'config.yaml'):
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
-        
-        self.mqtt_client = None
-        self.sensors: List[SensorSimulator] = []
-        self.running = False
-        
-    def on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            logger.info(f"Connected to MQTT broker at {self.config['mqtt']['broker']}")
-        else:
-            logger.error(f"Failed to connect, return code {rc}")
-    
-    def on_disconnect(self, client, userdata, rc):
-        if rc != 0:
-            logger.warning("Unexpected disconnect from MQTT broker")
-    
-    def on_publish(self, client, userdata, mid):
-        logger.debug(f"Message {mid} published")
-    
-    def setup_mqtt(self):
-        """Initialize MQTT client"""
-        self.mqtt_client = mqtt.Client(
-            client_id=f"simulator_{int(time.time())}"
-        )
-        
-        self.mqtt_client.on_connect = self.on_connect
-        self.mqtt_client.on_disconnect = self.on_disconnect
-        self.mqtt_client.on_publish = self.on_publish
-        
-        # Connect to broker
-        broker = self.config['mqtt']['broker']
-        port = self.config['mqtt']['port']
-        
-        logger.info(f"Connecting to MQTT broker {broker}:{port}...")
-        self.mqtt_client.connect(broker, port, keepalive=60)
-        self.mqtt_client.loop_start()
-    
+
+        self.devices: List[DeviceClient] = []
+
     def register_devices_with_registry(self):
         """Register devices with device-registry API (optional)"""
         if not self.config.get('device_registry', {}).get('enabled', False):
             logger.info("Device registration disabled in config")
             return
-        
+
         registry_url = self.config['device_registry'].get('url', 'http://localhost:8080')
         num_devices = self.config['simulation']['num_devices']
-        
+
         logger.info(f"Registering {num_devices} devices with registry at {registry_url}")
-        
+
         for i in range(num_devices):
             device_id = f"device_{i:04d}"
-            
-            # Prepare registration payload
             registration = {
                 "device_id": device_id,
                 "device_type": "simulated_sensor",
@@ -137,7 +206,7 @@ class IoTDeviceSimulator:
                     for sensor_type, sensor_config in self.config['sensor_types'].items()
                 ]
             }
-            
+
             try:
                 response = requests.post(
                     f"{registry_url}/api/v1/devices",
@@ -150,89 +219,63 @@ class IoTDeviceSimulator:
                     logger.warning(f"Failed to register {device_id}: {response.status_code}")
             except Exception as e:
                 logger.warning(f"Could not register {device_id}: {e}")
-        
+
         logger.info("Device registration complete")
-    
+
     def create_devices(self):
-        """Create simulated devices based on config"""
+        """Create one DeviceClient per device, each with its own MQTT client"""
         num_devices = self.config['simulation']['num_devices']
-        
+        interval = self.config['simulation']['interval_seconds']
+        sensor_configs = self.config['sensor_types']
+
         for i in range(num_devices):
             device_id = f"device_{i:04d}"
-            
-            # Create sensors for each device
-            for sensor_type, sensor_config in self.config['sensor_types'].items():
-                sensor = SensorSimulator(device_id, sensor_type, sensor_config)
-                self.sensors.append(sensor)
-        
-        logger.info(f"Created {len(self.sensors)} sensors across {num_devices} devices")
-    
-    def publish_reading(self, sensor: SensorSimulator):
-        """Publish sensor reading to MQTT"""
-        reading = sensor.generate_reading()
-        
-        topic = self.config['mqtt']['topic_template'].format(
-            device_id=reading['device_id']
-        )
-        
-        payload = json.dumps(reading)
-        
-        result = self.mqtt_client.publish(
-            topic,
-            payload,
-            qos=self.config['mqtt']['qos']
-        )
-        
-        if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            logger.debug(f"Published to {topic}: {reading['value']}")
-        else:
-            logger.error(f"Failed to publish to {topic}")
-    
+            device = DeviceClient(
+                device_id=device_id,
+                mqtt_config=self.config['mqtt'],
+                sensor_configs=sensor_configs,
+                interval=interval
+            )
+            self.devices.append(device)
+
+        total_sensors = num_devices * len(sensor_configs)
+        logger.info(f"Created {num_devices} devices ({total_sensors} sensors), each with its own MQTT client")
+
     def run(self):
-        """Main simulation loop"""
-        self.setup_mqtt()
+        """Start all device clients and monitor"""
         self.create_devices()
-        
-        # Register devices with registry (if enabled)
         self.register_devices_with_registry()
-        
+
         interval = self.config['simulation']['interval_seconds']
-        logger.info(f"Starting simulation with {interval}s interval")
-        
-        self.running = True
-        message_count = 0
-        
+        logger.info(f"Starting {len(self.devices)} independent device clients (interval: {interval}s)")
+
+        # Start all devices
+        for device in self.devices:
+            device.start()
+
+        logger.info(f"All {len(self.devices)} devices started")
+
+        # Monitor loop
         try:
-            while self.running:
-                start_time = time.time()
-                
-                # Publish readings from all sensors
-                for sensor in self.sensors:
-                    self.publish_reading(sensor)
-                    message_count += 1
-                
-                elapsed = time.time() - start_time
+            while True:
+                time.sleep(30)
+                total = sum(d.message_count for d in self.devices)
+                connected = sum(1 for d in self.devices if d.connected)
                 logger.info(
-                    f"Published {len(self.sensors)} readings in {elapsed:.2f}s "
-                    f"(Total: {message_count})"
+                    f"[Monitor] Devices: {connected}/{len(self.devices)} connected | "
+                    f"Total messages: {total}"
                 )
-                
-                # Sleep until next interval
-                sleep_time = max(0, interval - elapsed)
-                time.sleep(sleep_time)
-                
         except KeyboardInterrupt:
             logger.info("Simulation stopped by user")
         finally:
             self.stop()
-    
+
     def stop(self):
-        """Stop simulation and cleanup"""
-        self.running = False
-        if self.mqtt_client:
-            self.mqtt_client.loop_stop()
-            self.mqtt_client.disconnect()
-        logger.info("Simulator stopped")
+        """Stop all device clients"""
+        logger.info("Stopping all devices...")
+        for device in self.devices:
+            device.stop()
+        logger.info("All devices stopped")
 
 
 def main():
