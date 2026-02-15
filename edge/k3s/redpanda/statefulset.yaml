@@ -1,0 +1,147 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redpanda
+  namespace: iot-edge
+  labels:
+    app: redpanda
+spec:
+  serviceName: redpanda-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redpanda
+  template:
+    metadata:
+      labels:
+        app: redpanda
+    spec:
+      # Init container writes dynamic config before Redpanda starts
+      initContainers:
+      - name: redpanda-configurator
+        image: docker.redpanda.com/redpandadata/redpanda:v23.3.5
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          ORDINAL=${POD_NAME##*-}
+          cat > /etc/redpanda/redpanda.yaml <<ENDCFG
+          redpanda:
+            data_directory: /var/lib/redpanda/data
+            node_id: ${ORDINAL}
+            developer_mode: true
+            auto_create_topics_enabled: false
+            rpc_server:
+              address: "0.0.0.0"
+              port: 33145
+            kafka_api:
+              - address: "0.0.0.0"
+                port: 9092
+                name: internal
+            admin:
+              - address: "0.0.0.0"
+                port: 9644
+                name: admin
+            advertised_rpc_api:
+              address: "${POD_NAME}.redpanda-headless.iot-edge.svc.cluster.local"
+              port: 33145
+            advertised_kafka_api:
+              - address: "${POD_NAME}.redpanda-headless.iot-edge.svc.cluster.local"
+                port: 9092
+                name: internal
+            seed_servers:
+              - host:
+                  address: "redpanda-0.redpanda-headless.iot-edge.svc.cluster.local"
+                  port: 33145
+          pandaproxy:
+            pandaproxy_api:
+              - address: "0.0.0.0"
+                port: 8082
+          schema_registry:
+            schema_registry_api:
+              - address: "0.0.0.0"
+                port: 8081
+          ENDCFG
+          echo "Redpanda config written for node ${ORDINAL}:"
+          cat /etc/redpanda/redpanda.yaml
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: redpanda-config
+          mountPath: /etc/redpanda
+      # Main Redpanda container — uses image's default entrypoint
+      containers:
+      - name: redpanda
+        image: docker.redpanda.com/redpandadata/redpanda:v23.3.5
+        # NO command field — preserves image ENTRYPOINT (/entrypoint.sh → exec "$@")
+        args:
+        - redpanda
+        - start
+        - "--smp=1"
+        - "--memory=1G"
+        - "--reserve-memory=0M"
+        - "--overprovisioned"
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - name: kafka
+          containerPort: 9092
+          protocol: TCP
+        - name: rpc
+          containerPort: 33145
+          protocol: TCP
+        - name: admin
+          containerPort: 9644
+          protocol: TCP
+        - name: http-proxy
+          containerPort: 8082
+          protocol: TCP
+        - name: schema-reg
+          containerPort: 8081
+          protocol: TCP
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        volumeMounts:
+        - name: redpanda-config
+          mountPath: /etc/redpanda
+        - name: redpanda-data
+          mountPath: /var/lib/redpanda/data
+        readinessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+      volumes:
+      - name: redpanda-config
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: redpanda-data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi
+      storageClassName: local-path

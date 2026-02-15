@@ -1,25 +1,24 @@
-# Device Registry - Quick Start
+# Device Registry - Quick Start (K3s)
 
 ## 🚀 5-Minute Guide
 
-### Start Service
+### Deploy with Edge System
 
 ```bash
-# Option 1: With entire edge system
-cd edge && ./start-edge.sh
-
-# Option 2: Standalone
-cd edge/services/device-registry
-python main.py
+cd edge
+./k3s-build-images.sh
+./k3s-deploy.sh
 ```
 
 ### Access Interactive Docs
 
 ```
-http://localhost:8080/docs
+http://localhost:31080/docs
 ```
 
 Click **"Try it out"** on any endpoint and test it live!
+
+**For remote access**: Replace `localhost` with K3s node IP.
 
 ---
 
@@ -28,7 +27,7 @@ Click **"Try it out"** on any endpoint and test it live!
 ### 1. Register a Device
 
 **Interactive (Easiest)**:
-1. Go to http://localhost:8080/docs
+1. Go to http://localhost:31080/docs
 2. Click `POST /api/v1/devices`
 3. Click "Try it out"
 4. Fill the form
@@ -36,7 +35,7 @@ Click **"Try it out"** on any endpoint and test it live!
 
 **Command Line**:
 ```bash
-curl -X POST http://localhost:8080/api/v1/devices \
+curl -X POST http://localhost:31080/api/v1/devices \
   -H "Content-Type: application/json" \
   -d '{
     "device_id": "sensor_001",
@@ -58,7 +57,7 @@ curl -X POST http://localhost:8080/api/v1/devices \
 ```python
 import requests
 
-requests.post("http://localhost:8080/api/v1/devices", json={
+requests.post("http://localhost:31080/api/v1/devices", json={
     "device_id": "sensor_001",
     "device_type": "temperature_sensor",
     "description": "Office temperature monitor",
@@ -75,230 +74,84 @@ requests.post("http://localhost:8080/api/v1/devices", json={
 ### 2. List All Devices
 
 ```bash
-curl http://localhost:8080/api/v1/devices | jq
+curl http://localhost:31080/api/v1/devices | jq
 
 # With filters
-curl "http://localhost:8080/api/v1/devices?device_type=temperature_sensor" | jq
-curl "http://localhost:8080/api/v1/devices?status=active" | jq
+curl "http://localhost:31080/api/v1/devices?device_type=temperature_sensor" | jq
 ```
 
-### 3. Get Device Info
+### 3. Get Device Details
 
 ```bash
-curl http://localhost:8080/api/v1/devices/sensor_001 | jq
+curl http://localhost:31080/api/v1/devices/sensor_001 | jq
 ```
 
-### 4. Update Last Seen (Heartbeat)
+### 4. Update Device
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/devices/sensor_001/heartbeat
+curl -X PUT http://localhost:31080/api/v1/devices/sensor_001 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "description": "Updated description",
+    "location": "New location"
+  }'
 ```
 
-### 5. Get Device Sensors
+### 5. Delete Device
 
 ```bash
-curl http://localhost:8080/api/v1/devices/sensor_001/sensors | jq
-```
-
-### 6. Health Check
-
-```bash
-curl http://localhost:8080/health | jq
+curl -X DELETE http://localhost:31080/api/v1/devices/sensor_001
 ```
 
 ---
 
-## 🧪 Test the Service
+## 🔍 Monitoring
+
+### Check Service Status
 
 ```bash
-cd edge/services/device-registry
-python test_api.py
+sudo k3s kubectl get pods -n iot-edge -l app=device-registry
+sudo k3s kubectl logs -f deployment/device-registry -n iot-edge
 ```
 
-**Expected output**: ✅ ALL TESTS PASSED!
+### Test API
+
+```bash
+# Health check
+curl http://localhost:31080/health
+
+# API info
+curl http://localhost:31080/
+```
 
 ---
 
 ## 🐛 Troubleshooting
 
-### Service won't start
+### Port Not Accessible
 
 ```bash
-# Check if port 8080 is in use
-lsof -i :8080
+# Check service
+sudo k3s kubectl get svc device-registry -n iot-edge
 
-# Use different port
-PORT=8081 python main.py
-```
+# Port forward if needed
+sudo k3s kubectl port-forward -n iot-edge svc/device-registry 8080:8080
 
-### Dependencies missing
-
-```bash
-pip install -r requirements.txt
-```
-
-### Docker build fails
-
-```bash
-cd edge/services/device-registry
-docker build -t device-registry:test .
-docker run -p 8080:8080 device-registry:test
-```
-
-### Test API connection
-
-```bash
+# Then access on port 8080
 curl http://localhost:8080/health
-
-# Expected response:
-# {"status":"healthy","devices":0}
 ```
 
----
-
-## 📚 Documentation
-
-- **Swagger UI**: http://localhost:8080/docs (interactive!)
-- **ReDoc**: http://localhost:8080/redoc (clean docs)
-- **Full README**: `README.md`
-- **Conversion Guide**: `/DEVICE_REGISTRY_CONVERSION.md`
-
----
-
-## 🎓 API Examples
-
-### Complex Registration
-
-```json
-{
-  "device_id": "freezer_monitor_001",
-  "device_type": "industrial_freezer",
-  "description": "Critical cold chain monitoring for pharmaceutical storage (-80°C to -60°C). Alerts if temperature exceeds -65°C for more than 5 minutes.",
-  "location": "Warehouse B, Cold Storage Room 3, Unit A5",
-  "metadata": {
-    "building": "Warehouse B",
-    "floor": "Basement",
-    "room": "Cold Storage 3",
-    "unit": "A5",
-    "critical": "true",
-    "alert_email": "ops@example.com",
-    "manufacturer": "FreezerTech Inc",
-    "model": "ULT-8000",
-    "serial": "FT2024-12345",
-    "install_date": "2024-01-15",
-    "service_interval_days": "90"
-  },
-  "sensors": [
-    {
-      "sensor_type": "temperature",
-      "unit": "celsius",
-      "min_value": -85,
-      "max_value": -55,
-      "description": "Primary temperature probe (internal chamber)"
-    },
-    {
-      "sensor_type": "temperature",
-      "unit": "celsius",
-      "min_value": -85,
-      "max_value": -55,
-      "description": "Backup temperature probe (redundancy)"
-    },
-    {
-      "sensor_type": "door_status",
-      "unit": "boolean",
-      "description": "Door open/close sensor (security)"
-    }
-  ]
-}
-```
-
-### Multi-Sensor Device
-
-```json
-{
-  "device_id": "env_station_roof",
-  "device_type": "weather_station",
-  "description": "Rooftop environmental monitoring station",
-  "location": "Building A, Rooftop, North Corner",
-  "sensors": [
-    {"sensor_type": "temperature", "unit": "celsius", "min_value": -20, "max_value": 50},
-    {"sensor_type": "humidity", "unit": "percent", "min_value": 0, "max_value": 100},
-    {"sensor_type": "pressure", "unit": "hPa", "min_value": 950, "max_value": 1050},
-    {"sensor_type": "wind_speed", "unit": "km/h", "min_value": 0, "max_value": 200},
-    {"sensor_type": "rainfall", "unit": "mm", "min_value": 0, "max_value": 500}
-  ]
-}
-```
-
----
-
-## ⚡ Pro Tips
-
-1. **Use Swagger UI for development** - fastest way to test
-2. **Add detailed descriptions** - helps LLM integration later
-3. **Use metadata liberally** - store anything useful
-4. **Set realistic min/max values** - helps anomaly detection
-5. **Keep device_id consistent** - use same format everywhere
-
----
-
-## 🔗 Integration with Other Services
-
-### Simulator Auto-Registration
-
-Devices automatically register when simulator starts:
-
-```yaml
-# simulator/config.yaml
-device_registry:
-  enabled: true
-  url: "http://localhost:8080"
-```
-
-### Transformation Service Queries
-
-Transformation service queries device context:
-
-```go
-// In transformation service
-deviceInfo := queryDeviceRegistry(deviceID)
-// Uses description for context-aware conversion
-```
-
----
-
-## 📊 Monitor Service
-
-### Watch Logs
+### Pod Not Running
 
 ```bash
-# Docker
-docker logs -f edge-device-registry
-
-# Local
-tail -f device_registry.log
-```
-
-### Check Health
-
-```bash
-watch -n 5 'curl -s http://localhost:8080/health | jq'
-```
-
-### Count Devices
-
-```bash
-curl -s http://localhost:8080/api/v1/devices | jq '.count'
+sudo k3s kubectl describe pod -n iot-edge -l app=device-registry
+sudo k3s kubectl logs -n iot-edge -l app=device-registry
 ```
 
 ---
 
-## 🎯 Next Steps
+## 📖 Full API Documentation
 
-1. **Start the service** ✅
-2. **Visit http://localhost:8080/docs** ✅
-3. **Register a test device** ✅
-4. **Run the simulator** ✅
-5. **Watch devices appear** ✅
+See [README.md](README.md) for complete API reference and architecture details.
 
-**You're ready to go!** 🚀
+Interactive docs always available at: **http://localhost:31080/docs**

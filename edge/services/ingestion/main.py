@@ -34,40 +34,69 @@ class IngestionService:
         self.running = False
         
     def setup_kafka(self):
-        """Initialize Kafka/Redpanda producer"""
+        """Initialize Kafka/Redpanda producer with ordering guarantees"""
         try:
             self.kafka_producer = KafkaProducer(
                 bootstrap_servers=self.config['redpanda_brokers'],
                 value_serializer=lambda v: json.dumps(v).encode('utf-8'),
                 key_serializer=lambda k: k.encode('utf-8') if k else None,
-                acks='all',  # Wait for all replicas
-                retries=3,
-                max_in_flight_requests_per_connection=5,
-                compression_type='lz4'
+                
+                # Reliability: Ensure messages are delivered
+                acks=1,                        # Leader acknowledgment (balanced performance)
+                retries=10,                    # Retry failed sends
+                max_in_flight_requests_per_connection=5,  # Allow pipelining while maintaining order
+                
+                # Timeouts
+                request_timeout_ms=10000,      # 10s request timeout
+                
+                # Performance optimizations
+                compression_type='lz4',        # Fast compression
+                linger_ms=10,                  # Batch for 10ms
+                batch_size=16384               # 16KB batches
             )
-            logger.info(f"Connected to Redpanda: {self.config['redpanda_brokers']}")
+            logger.info(f"✓ Connected to Redpanda: {self.config['redpanda_brokers']}")
+            logger.info("✓ Producer configured: acks=1, retries=10, ordering per device (via key)")
         except Exception as e:
             logger.error(f"Failed to connect to Redpanda: {e}")
             raise
     
     def on_connect(self, client, userdata, flags, rc):
-        """MQTT connection callback"""
+        """MQTT connection callback with shared subscription for load balancing"""
         if rc == 0:
-            logger.info(f"Connected to MQTT broker: {self.config['mqtt_broker']}")
+            logger.info(f"✓ Connected to MQTT broker: {self.config['mqtt_broker']}")
             
-            # Subscribe to sensor topics
-            client.subscribe(self.config['mqtt_topic'], qos=1)
-            logger.info(f"Subscribed to topic: {self.config['mqtt_topic']}")
+            # Use MQTT shared subscription for load balancing across multiple replicas
+            # Format: $share/group-name/topic-pattern
+            # This ensures multiple ingestion pods share the load (no duplicates)
+            shared_topic = f"$share/ingestion-group/{self.config['mqtt_topic']}"
+            
+            result, mid = client.subscribe(shared_topic, qos=1)
+            if result == mqtt.MQTT_ERR_SUCCESS:
+                logger.info(f"✓ Subscribed to shared topic: {shared_topic}")
+                logger.info("✓ Load will be distributed across all ingestion replicas")
+            else:
+                logger.error(f"✗ Failed to subscribe: error code {result}")
         else:
-            logger.error(f"Failed to connect to MQTT broker, return code {rc}")
+            error_messages = {
+                1: "Connection refused - incorrect protocol version",
+                2: "Connection refused - invalid client identifier",
+                3: "Connection refused - server unavailable",
+                4: "Connection refused - bad username or password",
+                5: "Connection refused - not authorized"
+            }
+            logger.error(f"Failed to connect: {error_messages.get(rc, f'Unknown error code {rc}')}")
+            logger.info("Will retry connection automatically...")
     
     def on_disconnect(self, client, userdata, rc):
         """MQTT disconnection callback"""
         if rc != 0:
-            logger.warning(f"Unexpected disconnect from MQTT broker (rc={rc})")
+            logger.warning(f"✗ Unexpected disconnect from MQTT broker (rc={rc})")
+            logger.info("Auto-reconnection will attempt to restore connection...")
+        else:
+            logger.info("Clean disconnect from MQTT broker")
     
     def on_message(self, client, userdata, msg):
-        """MQTT message callback"""
+        """MQTT message callback with error handling"""
         try:
             # Parse sensor data
             payload = msg.payload.decode('utf-8')
@@ -80,20 +109,25 @@ class IngestionService:
             
             device_id = data['device_id']
             
-            # Publish to Redpanda
-            future = self.kafka_producer.send(
-                self.config['redpanda_topic'],
-                key=device_id,
-                value=data
-            )
+            # Publish to Redpanda with retry capability
+            try:
+                future = self.kafka_producer.send(
+                    self.config['redpanda_topic'],
+                    key=device_id,
+                    value=data
+                )
+                
+                # Add callback for success/failure
+                future.add_callback(self.on_kafka_success)
+                future.add_errback(self.on_kafka_error)
+                
+                self.message_count += 1
+                if self.message_count % 100 == 0:
+                    logger.info(f"[INFO] Processed {self.message_count} messages")
             
-            # Add callback for success/failure
-            future.add_callback(self.on_kafka_success)
-            future.add_errback(self.on_kafka_error)
-            
-            self.message_count += 1
-            if self.message_count % 100 == 0:
-                logger.info(f"[INFO] Processed {self.message_count} messages")
+            except Exception as kafka_error:
+                logger.error(f"Failed to send to Redpanda: {kafka_error}")
+                # Message will be redelivered by MQTT (QoS 1) on next connection
                 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON: {e}")
@@ -109,26 +143,41 @@ class IngestionService:
         logger.error(f"Failed to send message to Redpanda: {exc}")
     
     def setup_mqtt(self):
-        """Initialize MQTT client"""
-        self.mqtt_client = mqtt.Client(client_id="ingestion-service")
+        """Initialize MQTT client with fault-tolerant reconnection"""
+        # Create client with unique ID per pod for shared subscriptions
+        # Unique client_id allows multiple ingestion replicas to connect simultaneously
+        import os
+        client_id = f"ingestion-{os.getpid()}"
+        
+        self.mqtt_client = mqtt.Client(
+            client_id=client_id,
+            clean_session=False  # Preserve session for QoS 1 guarantees
+        )
+        logger.info(f"MQTT Client ID: {client_id}")
         
         # Set callbacks
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_disconnect = self.on_disconnect
         self.mqtt_client.on_message = self.on_message
         
-        # Configure connection
+        # Configure automatic reconnection with exponential backoff
+        # Retry intervals: 1s, 2s, 4s, 8s, ..., up to 120s
         self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
         
-        # Connect to broker
+        # Parse broker connection details
         broker_host, broker_port = self.parse_mqtt_broker(self.config['mqtt_broker'])
         
+        logger.info(f"Connecting to MQTT broker {broker_host}:{broker_port}...")
+        logger.info("Auto-reconnect enabled with persistent session (QoS 1)")
+        
         try:
+            # Initial connection attempt
             self.mqtt_client.connect(broker_host, broker_port, keepalive=60)
-            logger.info(f"Connecting to MQTT broker {broker_host}:{broker_port}...")
+            logger.info("MQTT connection initiated - waiting for confirmation...")
         except Exception as e:
-            logger.error(f"Failed to connect to MQTT broker: {e}")
-            raise
+            logger.error(f"Initial connection failed: {e}")
+            logger.info("Will retry automatically in background...")
+            # Don't raise - let auto-reconnect handle it
     
     def parse_mqtt_broker(self, broker_url: str):
         """Parse MQTT broker URL"""

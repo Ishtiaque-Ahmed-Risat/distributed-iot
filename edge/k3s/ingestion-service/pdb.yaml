@@ -1,0 +1,13 @@
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ingestion-service-pdb
+  namespace: iot-edge
+  labels:
+    app: ingestion-service
+spec:
+  minAvailable: 1  # At least 1 pod must be available during updates/evictions
+  selector:
+    matchLabels:
+      app: ingestion-service

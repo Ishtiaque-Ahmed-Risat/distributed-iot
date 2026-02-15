@@ -1,0 +1,27 @@
+---
+# Headless service for StatefulSet stable network identity
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda-headless
+  namespace: iot-edge
+  labels:
+    app: redpanda
+spec:
+  clusterIP: None  # Headless
+  publishNotReadyAddresses: true
+  selector:
+    app: redpanda
+  ports:
+  - name: kafka
+    port: 9092
+    targetPort: 9092
+    protocol: TCP
+  - name: rpc
+    port: 33145
+    targetPort: 33145
+    protocol: TCP
+  - name: admin
+    port: 9644
+    targetPort: 9644
+    protocol: TCP

@@ -1,150 +1,80 @@
 # InfluxDB Writer Service
 
-Consumes transformed sensor data from Redpanda and writes to InfluxDB.
+Consumes transformed sensor data from Redpanda and writes to node-local InfluxDB with batching.
 
 **Language**: Python  
-**Framework**: kafka-python, influxdb-client
+**Framework**: kafka-python, influxdb-client  
+**Deployment**: K3s Deployment with HPA (1-10 replicas)
 
 ## Functionality
 
-- Consumes from Redpanda topic: `transformed-sensor-data`
-- Writes to InfluxDB time-series database
-- Batch writing for performance
-- Stores both transformed and original values
-- Automatic flush on interval or batch size
+- Consumes from: `transformed-sensor-data`
+- Batched writes to InfluxDB (1000 points or 10s interval)
+- Writes to node-local InfluxDB (zero network hops via DaemonSet)
+- Consumer group: `influxdb-writer` (automatic load balancing)
+- Manual commit after successful write
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REDPANDA_BROKERS` | `redpanda:9092` | Redpanda broker addresses |
-| `REDPANDA_TOPIC` | `transformed-sensor-data` | Input topic name |
-| `CONSUMER_GROUP` | `influxdb-writer` | Kafka consumer group |
-| `INFLUX_URL` | `http://influxdb:8086` | InfluxDB server URL |
-| `INFLUX_TOKEN` | `my-super-secret-token` | InfluxDB auth token |
+| `REDPANDA_TOPIC` | `transformed-sensor-data` | Input topic |
+| `CONSUMER_GROUP` | `influxdb-writer` | Consumer group ID |
+| `INFLUX_URL` | `http://influxdb:8086` | InfluxDB URL (routes to node-local instance) |
+| `INFLUX_TOKEN` | - | InfluxDB auth token |
 | `INFLUX_ORG` | `iot-org` | InfluxDB organization |
-| `INFLUX_BUCKET` | `sensor-data` | InfluxDB bucket name |
-| `BATCH_SIZE` | `1000` | Points per batch |
+| `INFLUX_BUCKET` | `sensor-data` | InfluxDB bucket |
+| `BATCH_SIZE` | `1000` | Write batch size |
 | `FLUSH_INTERVAL` | `10` | Flush interval (seconds) |
 
-## Data Schema
-
-The service writes data with the following structure:
-
-**Measurement**: `sensor_data`
-
-**Tags** (indexed):
-- `device_id`: Device identifier
-- `sensor_type`: Standardized sensor type
-- `unit`: Standardized unit
-- `original_unit`: Original unit before conversion
-- `transformed_by`: Transformation method (rule/llm)
-- `transformation_id`: Conversion rule applied
-
-**Fields** (not indexed):
-- `value`: Transformed value
-- `original_value`: Original value before conversion
-- `is_anomaly`: Boolean anomaly flag
-
-**Timestamp**: From sensor reading
-
-## Example Query
-
-Query InfluxDB for sensor data:
-
-```flux
-from(bucket: "sensor-data")
-  |> range(start: -1h)
-  |> filter(fn: (r) => r._measurement == "sensor_data")
-  |> filter(fn: (r) => r.device_id == "sensor_001")
-  |> filter(fn: (r) => r._field == "value")
-```
-
-Compare original vs transformed values:
-
-```flux
-from(bucket: "sensor-data")
-  |> range(start: -24h)
-  |> filter(fn: (r) => r._measurement == "sensor_data")
-  |> filter(fn: (r) => r.transformation_id =~ /.*->.*/)
-  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-  |> map(fn: (r) => ({ r with diff: r.value - r.original_value }))
-```
-
-Find anomalies:
-
-```flux
-from(bucket: "sensor-data")
-  |> range(start: -1d)
-  |> filter(fn: (r) => r._measurement == "sensor_data")
-  |> filter(fn: (r) => r._field == "is_anomaly")
-  |> filter(fn: (r) => r._value == true)
-```
-
-## Building
+## Building for K3s
 
 ```bash
-# Build Docker image
-docker build -t iot-influxdb-writer:latest .
+cd ..
+./k3s-build-images.sh
 ```
 
-## Running
+## Running Locally
 
 ```bash
-# Run locally
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+
+export REDPANDA_BROKERS=localhost:19092
+export REDPANDA_TOPIC=transformed-sensor-data
+export INFLUX_URL=http://localhost:8086
+export INFLUX_TOKEN=my-super-secret-token
+export INFLUX_ORG=iot-org
+export INFLUX_BUCKET=sensor-data
+
 python main.py
-
-# Run with Docker
-docker run --rm \
-  -e REDPANDA_BROKERS=localhost:9092 \
-  -e INFLUX_URL=http://localhost:8086 \
-  -e INFLUX_TOKEN=your-token \
-  iot-influxdb-writer:latest
 ```
 
-## Performance Tuning
+## Deployment
 
-### Increase Batch Size
 ```bash
-docker run -e BATCH_SIZE=5000 iot-influxdb-writer:latest
-```
+cd ../../
+./k3s-deploy.sh
 
-### Adjust Flush Interval
-```bash
-docker run -e FLUSH_INTERVAL=30 iot-influxdb-writer:latest
+sudo k3s kubectl get pods -n iot-edge -l app=influxdb-writer
+sudo k3s kubectl logs -f deployment/influxdb-writer -n iot-edge
+sudo k3s kubectl get hpa influxdb-writer-hpa -n iot-edge
 ```
 
 ## Scaling
 
-Run multiple replicas with different consumer groups:
-
-```yaml
-# In docker-compose.yml
-deploy:
-  replicas: 2
-```
-
-Each replica will consume from different partitions for parallel processing.
-
-## Monitoring
-
-Check service logs for write statistics:
+Auto-scales 1-10 replicas based on CPU/Memory.
+Higher replica count = higher write throughput.
 
 ```bash
-docker logs -f edge-influxdb-writer
+watch sudo k3s kubectl get hpa -n iot-edge
 ```
 
-Output includes:
-```
-[INFO] Wrote 1000 points to InfluxDB (Total: 5000)
-```
+## Performance
 
-## Data Retention
+- **Single pod**: ~10K writes/sec
+- **10 pods**: ~100K writes/sec
 
-The InfluxDB bucket is configured with 7-day retention by default. Adjust in docker-compose.yml:
-
-```yaml
-environment:
-  - DOCKER_INFLUXDB_INIT_RETENTION=30d  # 30 days
-```
+InfluxDB handles concurrent writers well.

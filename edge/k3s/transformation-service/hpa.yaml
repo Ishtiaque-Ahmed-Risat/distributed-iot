@@ -1,0 +1,28 @@
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: transformation-service-hpa
+  namespace: iot-edge
+  labels:
+    app: transformation-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: transformation-service
+  minReplicas: 2
+  maxReplicas: 30  # Match Redpanda partitions (30)
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80

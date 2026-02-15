@@ -1,0 +1,54 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-service
+  namespace: iot-edge
+  labels:
+    app: ingestion-service
+    component: data-pipeline
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ingestion-service
+  template:
+    metadata:
+      labels:
+        app: ingestion-service
+        component: data-pipeline
+    spec:
+      containers:
+      - name: ingestion-service
+        image: ingestion-service:latest
+        imagePullPolicy: Never  # For local K3s development
+        env:
+        - name: MQTT_BROKER
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: MQTT_BROKER
+        - name: MQTT_TOPIC
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: MQTT_TOPIC
+        - name: REDPANDA_BROKERS
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: REDPANDA_BROKERS
+        - name: REDPANDA_TOPIC
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: REDPANDA_TOPIC_RAW
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        # No health check endpoints in current implementation
+        # Could add in future version

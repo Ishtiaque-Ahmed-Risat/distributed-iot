@@ -1,0 +1,100 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redpanda-topic-init
+  namespace: iot-edge
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: rpk-init
+        image: docker.redpanda.com/redpandadata/redpanda:v23.3.5
+        command:
+        - bash
+        - -c
+        - |
+          set -e
+          BROKERS="redpanda.iot-edge.svc.cluster.local:9092"
+          PARTITIONS=10
+          REPLICAS=1
+          RETENTION_MS=3600000
+
+          echo "============================================"
+          echo "Redpanda Topic Initialization"
+          echo "============================================"
+
+          ADMIN_API="redpanda.iot-edge.svc.cluster.local:9644"
+
+          # Wait for Redpanda to be ready
+          echo "Waiting for Redpanda to be ready..."
+          READY=false
+          for i in $(seq 1 60); do
+            if rpk cluster health --api-urls "$ADMIN_API" 2>/dev/null | grep -q "Healthy"; then
+              echo "Redpanda is healthy!"
+              READY=true
+              break
+            fi
+            echo "Attempt $i/60: Redpanda not ready yet..."
+            sleep 5
+          done
+
+          if [ "$READY" != "true" ]; then
+            echo "ERROR: Redpanda did not become healthy within 300s"
+            exit 1
+          fi
+
+          # Function: create topic or ensure correct partition count
+          ensure_topic() {
+            local TOPIC=$1
+            echo ""
+            echo "--- Ensuring topic: $TOPIC ---"
+
+            # Try to create the topic
+            if rpk topic create "$TOPIC" \
+              --brokers "$BROKERS" \
+              --partitions "$PARTITIONS" \
+              --replicas "$REPLICAS" \
+              --topic-config retention.ms="$RETENTION_MS" 2>/dev/null; then
+              echo "✓ Created topic $TOPIC with $PARTITIONS partitions"
+            else
+              echo "Topic $TOPIC already exists. Checking partition count..."
+              CURRENT=$(rpk topic describe "$TOPIC" --brokers "$BROKERS" 2>/dev/null | grep "PARTITION" | wc -l)
+              # Subtract 1 for the header line
+              CURRENT=$((CURRENT > 0 ? CURRENT - 1 : 0))
+              # Alternative: count actual partition lines (numbers)
+              CURRENT=$(rpk topic describe "$TOPIC" --brokers "$BROKERS" 2>/dev/null | grep -cE "^\s*[0-9]+" || echo "0")
+
+              echo "  Current partitions: $CURRENT, Desired: $PARTITIONS"
+
+              if [ "$CURRENT" -lt "$PARTITIONS" ] 2>/dev/null; then
+                NEEDED=$((PARTITIONS - CURRENT))
+                echo "  Adding $NEEDED partitions..."
+                rpk topic add-partitions "$TOPIC" --num "$NEEDED" --brokers "$BROKERS" 2>/dev/null \
+                  && echo "✓ Expanded $TOPIC to $PARTITIONS partitions" \
+                  || echo "⚠ Could not add partitions (may need manual intervention)"
+              else
+                echo "✓ Topic $TOPIC already has $CURRENT partitions (>= $PARTITIONS)"
+              fi
+
+              # Ensure retention config
+              rpk topic alter-config "$TOPIC" \
+                --set retention.ms="$RETENTION_MS" \
+                --brokers "$BROKERS" 2>/dev/null \
+                && echo "✓ Retention set to ${RETENTION_MS}ms" \
+                || echo "⚠ Could not set retention config"
+            fi
+          }
+
+          # Create/ensure both topics
+          ensure_topic "raw-sensor-data"
+          ensure_topic "transformed-sensor-data"
+
+          echo ""
+          echo "============================================"
+          echo "Topic initialization complete!"
+          echo "============================================"
+          rpk topic list --brokers "$BROKERS"

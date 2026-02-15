@@ -11,7 +11,7 @@ import os
 import signal
 import sys
 from typing import Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 from kafka import KafkaConsumer
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS
@@ -103,9 +103,8 @@ class InfluxWriterService:
         point.field("original_value", float(data['original_value']))
         point.field("is_anomaly", bool(data.get('is_anomaly', False)))
         
-        # Set timestamp
-        timestamp = datetime.fromtimestamp(data['timestamp'])
-        point.time(timestamp, WritePrecision.S)
+        # Set timestamp (epoch is already UTC from simulator)
+        point.time(int(data['timestamp']), WritePrecision.S)
         
         return point
     

@@ -1,0 +1,93 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: influxdb
+  namespace: iot-edge
+  labels:
+    app: influxdb
+    component: timeseries-db
+spec:
+  selector:
+    matchLabels:
+      app: influxdb
+  template:
+    metadata:
+      labels:
+        app: influxdb
+        component: timeseries-db
+    spec:
+      containers:
+      - name: influxdb
+        image: influxdb:2.7-alpine
+        ports:
+        - name: http
+          containerPort: 8086
+          protocol: TCP
+        env:
+        - name: DOCKER_INFLUXDB_INIT_MODE
+          value: "setup"
+        - name: DOCKER_INFLUXDB_INIT_USERNAME
+          value: "admin"
+        - name: DOCKER_INFLUXDB_INIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: edge-secrets
+              key: INFLUX_ADMIN_PASSWORD
+        - name: DOCKER_INFLUXDB_INIT_ORG
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: INFLUX_ORG
+        - name: DOCKER_INFLUXDB_INIT_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: INFLUX_BUCKET
+        - name: DOCKER_INFLUXDB_INIT_ADMIN_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: edge-secrets
+              key: INFLUX_TOKEN
+        - name: DOCKER_INFLUXDB_INIT_RETENTION
+          value: "7d"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: influxdb-data
+          mountPath: /var/lib/influxdb2
+        - name: influxdb-config
+          mountPath: /etc/influxdb2
+        livenessProbe:
+          exec:
+            command:
+            - influx
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 5
+        readinessProbe:
+          exec:
+            command:
+            - influx
+            - ping
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      volumes:
+      # Use hostPath for node-local storage (one InfluxDB per node)
+      - name: influxdb-data
+        hostPath:
+          path: /var/lib/influxdb-edge/data
+          type: DirectoryOrCreate
+      - name: influxdb-config
+        hostPath:
+          path: /var/lib/influxdb-edge/config
+          type: DirectoryOrCreate

@@ -1,0 +1,77 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: influxdb-writer
+  namespace: iot-edge
+  labels:
+    app: influxdb-writer
+    component: data-pipeline
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: influxdb-writer
+  template:
+    metadata:
+      labels:
+        app: influxdb-writer
+        component: data-pipeline
+    spec:
+      containers:
+      - name: influxdb-writer
+        image: influxdb-writer:latest
+        imagePullPolicy: Never  # For local K3s development
+        env:
+        - name: REDPANDA_BROKERS
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: REDPANDA_BROKERS
+        - name: REDPANDA_TOPIC
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: REDPANDA_TOPIC_TRANSFORMED
+        - name: CONSUMER_GROUP
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: CONSUMER_GROUP_INFLUXDB
+        - name: INFLUX_URL
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: INFLUX_URL
+        - name: INFLUX_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: edge-secrets
+              key: INFLUX_TOKEN
+        - name: INFLUX_ORG
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: INFLUX_ORG
+        - name: INFLUX_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: INFLUX_BUCKET
+        - name: BATCH_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: BATCH_SIZE
+        - name: FLUSH_INTERVAL
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: FLUSH_INTERVAL
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"

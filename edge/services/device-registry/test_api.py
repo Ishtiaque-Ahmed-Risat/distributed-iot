@@ -8,7 +8,7 @@ import requests
 import json
 from datetime import datetime
 
-BASE_URL = "http://localhost:8080"
+BASE_URL = "http://localhost:31080"  # K3s NodePort
 
 def print_response(title, response):
     """Pretty print API response"""
@@ -184,7 +184,7 @@ if __name__ == "__main__":
     except requests.exceptions.ConnectionError:
         print("\n❌ Error: Could not connect to Device Registry")
         print("Make sure the service is running:")
-        print("  cd edge && docker-compose up device-registry")
+        print("  cd edge && ./k3s-deploy.sh")
         print("  OR")
         print("  cd edge/services/device-registry && python main.py")
     except AssertionError as e:

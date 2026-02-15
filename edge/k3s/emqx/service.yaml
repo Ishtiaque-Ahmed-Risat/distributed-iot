@@ -1,0 +1,32 @@
+---
+# NodePort service for external client access (load balanced across pods)
+apiVersion: v1
+kind: Service
+metadata:
+  name: emqx
+  namespace: iot-edge
+  labels:
+    app: emqx
+  annotations:
+    service.kubernetes.io/topology-mode: "auto"
+spec:
+  type: NodePort
+  sessionAffinity: None  # Each connection independently load-balanced; session replication handles reconnects
+  selector:
+    app: emqx
+  ports:
+  - name: mqtt
+    port: 1883
+    targetPort: 1883
+    nodePort: 31883
+    protocol: TCP
+  - name: websocket
+    port: 8083
+    targetPort: 8083
+    nodePort: 31083
+    protocol: TCP
+  - name: dashboard
+    port: 18083
+    targetPort: 18083
+    nodePort: 31803
+    protocol: TCP

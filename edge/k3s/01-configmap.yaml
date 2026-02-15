@@ -1,0 +1,30 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-config
+  namespace: iot-edge
+data:
+  # MQTT Configuration
+  MQTT_BROKER: "tcp://emqx:1883"
+  MQTT_TOPIC: "sensors/+/data"
+  
+  # Redpanda Configuration
+  REDPANDA_BROKERS: "redpanda:9092"
+  REDPANDA_TOPIC_RAW: "raw-sensor-data"
+  REDPANDA_TOPIC_TRANSFORMED: "transformed-sensor-data"
+  
+  # InfluxDB Configuration
+  INFLUX_URL: "http://influxdb:8086"
+  INFLUX_ORG: "iot-org"
+  INFLUX_BUCKET: "sensor-data"
+  
+  # Service Configuration
+  BATCH_SIZE: "1000"
+  FLUSH_INTERVAL: "10"
+  ENABLE_LLM: "false"
+  LLM_SERVICE_URL: "http://llm-service:8080"
+  
+  # Consumer Groups
+  CONSUMER_GROUP_TRANSFORMATION: "transformation-service"
+  CONSUMER_GROUP_INFLUXDB: "influxdb-writer"

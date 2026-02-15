@@ -1,0 +1,161 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: emqx
+  namespace: iot-edge
+  labels:
+    app: emqx
+    component: mqtt-broker
+spec:
+  serviceName: emqx-headless  # Headless service for stable network identity
+  replicas: 2  # Default 2 for HA, scale to 3+ with demo-mode.sh
+  podManagementPolicy: Parallel  # Parallel pod creation for faster startup
+  selector:
+    matchLabels:
+      app: emqx
+  template:
+    metadata:
+      labels:
+        app: emqx
+        component: mqtt-broker
+    spec:
+      containers:
+      - name: emqx
+        image: emqx:5.5
+        ports:
+        - name: mqtt
+          containerPort: 1883
+          protocol: TCP
+        - name: websocket
+          containerPort: 8083
+          protocol: TCP
+        - name: dashboard
+          containerPort: 18083
+          protocol: TCP
+        - name: cluster
+          containerPort: 4370  # EMQX clustering port
+          protocol: TCP
+        - name: dist
+          containerPort: 5369  # Erlang distribution port
+          protocol: TCP
+        env:
+        # Node name with stable identity
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: EMQX_NODE_NAME
+          value: "emqx@$(POD_NAME).emqx-headless.$(POD_NAMESPACE).svc.cluster.local"
+        
+        # Basic EMQX configuration
+        - name: EMQX_HOST
+          value: "$(POD_NAME).emqx-headless.$(POD_NAMESPACE).svc.cluster.local"
+        - name: EMQX_NODE__COOKIE
+          value: "emqx-cluster-cookie-secret"  # Shared secret for clustering
+        
+        # MQTT session configuration (AP optimized)
+        - name: EMQX_MQTT__SESSION_EXPIRY_INTERVAL
+          value: "30m"  # Session persists for 30 minutes (reduced from 2h for less memory)
+        - name: EMQX_MQTT__MAX_INFLIGHT
+          value: "100"  # Max in-flight messages per client
+        - name: EMQX_MQTT__MAX_AWAITING_REL
+          value: "100"
+        - name: EMQX_MQTT__AWAIT_REL_TIMEOUT
+          value: "300s"
+        
+        # Persistent session storage (critical for fault tolerance)
+        - name: EMQX_MQTT__RETAIN_AVAILABLE
+          value: "true"
+        - name: EMQX_MQTT__MAX_PACKET_SIZE
+          value: "1MB"
+        
+        # Cluster discovery configuration (DNS-based)
+        - name: EMQX_CLUSTER__DISCOVERY_STRATEGY
+          value: "dns"  # Use DNS for automatic cluster formation
+        - name: EMQX_CLUSTER__DNS__NAME
+          value: "emqx-headless.iot-edge.svc.cluster.local"
+        - name: EMQX_CLUSTER__DNS__RECORD_TYPE
+          value: "srv"  # Use SRV records for discovery
+        
+        # Cluster auto-heal and auto-clean
+        - name: EMQX_CLUSTER__AUTOHEAL
+          value: "true"  # Automatically heal network partitions
+        - name: EMQX_CLUSTER__AUTOCLEAN
+          value: "5m"  # Clean disconnected nodes after 5 minutes
+        
+        # Session replication across cluster (AP mode)
+        - name: EMQX_BROKER__SESSION_LOCKING_STRATEGY
+          value: "local"  # Favor availability over consistency
+        - name: EMQX_BROKER__SHARED_SUBSCRIPTION_STRATEGY
+          value: "round_robin"  # Better load distribution than sticky
+        
+        # Persistence and durability
+        - name: EMQX_LOG__LEVEL
+          value: "warning"
+        - name: EMQX_ALLOW_ANONYMOUS
+          value: "true"  # For development; set false in production
+        
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        
+        volumeMounts:
+        - name: emqx-data
+          mountPath: /opt/emqx/data
+        - name: emqx-log
+          mountPath: /opt/emqx/log
+        
+        livenessProbe:
+          exec:
+            command:
+            - emqx
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 5
+        
+        readinessProbe:
+          exec:
+            command:
+            - emqx
+            - ping
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+  
+  # Persistent volume claim templates (one per pod)
+  volumeClaimTemplates:
+  - metadata:
+      name: emqx-data
+      labels:
+        app: emqx
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 5Gi
+      storageClassName: local-path
+  
+  - metadata:
+      name: emqx-log
+      labels:
+        app: emqx
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 2Gi
+      storageClassName: local-path

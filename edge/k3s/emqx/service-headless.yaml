@@ -1,0 +1,35 @@
+---
+# Headless service for EMQX cluster discovery and stable network identity
+apiVersion: v1
+kind: Service
+metadata:
+  name: emqx-headless
+  namespace: iot-edge
+  labels:
+    app: emqx
+spec:
+  clusterIP: None  # Headless service (no load balancing)
+  publishNotReadyAddresses: true  # Allow DNS records for non-ready pods (needed for clustering)
+  selector:
+    app: emqx
+  ports:
+  - name: mqtt
+    port: 1883
+    targetPort: 1883
+    protocol: TCP
+  - name: websocket
+    port: 8083
+    targetPort: 8083
+    protocol: TCP
+  - name: dashboard
+    port: 18083
+    targetPort: 18083
+    protocol: TCP
+  - name: cluster
+    port: 4370
+    targetPort: 4370
+    protocol: TCP
+  - name: dist
+    port: 5369
+    targetPort: 5369
+    protocol: TCP

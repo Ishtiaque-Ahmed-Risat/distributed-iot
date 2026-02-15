@@ -1,0 +1,13 @@
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: influxdb-writer-pdb
+  namespace: iot-edge
+  labels:
+    app: influxdb-writer
+spec:
+  minAvailable: 1  # At least 1 pod must be available during updates/evictions
+  selector:
+    matchLabels:
+      app: influxdb-writer
