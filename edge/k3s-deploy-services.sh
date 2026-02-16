@@ -38,24 +38,28 @@ fi
 echo ""
 
 # Deploy services
-echo -e "${YELLOW}[1/5] Device Registry...${NC}"
+echo -e "${YELLOW}[1/6] Device Registry...${NC}"
 sudo k3s kubectl apply -f k3s/device-registry/
 echo -e "${GREEN}✓ Deployed${NC}"
 
-echo -e "${YELLOW}[2/5] Ingestion Service...${NC}"
+echo -e "${YELLOW}[2/6] Ingestion Service...${NC}"
 sudo k3s kubectl apply -f k3s/ingestion-service/
 echo -e "${GREEN}✓ Deployed${NC}"
 
-echo -e "${YELLOW}[3/5] Transformation Service...${NC}"
+echo -e "${YELLOW}[3/6] Transformation Service...${NC}"
 sudo k3s kubectl apply -f k3s/transformation-service/
 echo -e "${GREEN}✓ Deployed${NC}"
 
-echo -e "${YELLOW}[4/5] InfluxDB Writer...${NC}"
+echo -e "${YELLOW}[4/6] InfluxDB Writer...${NC}"
 sudo k3s kubectl apply -f k3s/influxdb-writer/
 echo -e "${GREEN}✓ Deployed${NC}"
 
-echo -e "${YELLOW}[5/5] Cloud Uplink...${NC}"
+echo -e "${YELLOW}[5/6] Cloud Uplink...${NC}"
 sudo k3s kubectl apply -f k3s/cloud-uplink/
+echo -e "${GREEN}✓ Deployed${NC}"
+
+echo -e "${YELLOW}[6/6] Anomaly Alert...${NC}"
+sudo k3s kubectl apply -f k3s/anomaly-alert/
 echo -e "${GREEN}✓ Deployed${NC}"
 
 echo ""

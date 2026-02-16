@@ -1,0 +1,80 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anomaly-alert
+  namespace: iot-edge
+  labels:
+    app: anomaly-alert
+    component: ml-inference
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: anomaly-alert
+  template:
+    metadata:
+      labels:
+        app: anomaly-alert
+        component: ml-inference
+    spec:
+      containers:
+      - name: anomaly-alert
+        image: anomaly-alert:latest
+        imagePullPolicy: Never
+        env:
+        # Edge Redpanda
+        - name: REDPANDA_BROKERS
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: REDPANDA_BROKERS
+        - name: REDPANDA_TOPIC
+          valueFrom:
+            configMapKeyRef:
+              name: edge-config
+              key: REDPANDA_TOPIC_TRANSFORMED
+        - name: CONSUMER_GROUP
+          value: "anomaly-alert-group"
+        # MinIO (cloud, accessible via node IP)
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: MINIO_ENDPOINT
+          value: "http://$(HOST_IP):9000"
+        - name: MINIO_ACCESS_KEY
+          value: "minioadmin"
+        - name: MINIO_SECRET_KEY
+          value: "minioadmin"
+        - name: MODEL_BUCKET
+          value: "iot-models"
+        - name: MODEL_UPDATE_INTERVAL
+          value: "60"
+        - name: BUFFER_WINDOW_SECONDS
+          value: "10"
+        - name: MAX_BUFFER_SIZE
+          value: "10000"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        readinessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "import sys; sys.exit(0)"
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "import sys; sys.exit(0)"
+          initialDelaySeconds: 30
+          periodSeconds: 30

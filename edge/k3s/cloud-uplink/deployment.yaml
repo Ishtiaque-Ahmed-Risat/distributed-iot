@@ -8,7 +8,7 @@ metadata:
     app: cloud-uplink
     component: data-pipeline
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: cloud-uplink

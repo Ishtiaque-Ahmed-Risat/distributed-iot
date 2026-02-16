@@ -389,12 +389,15 @@ Transformation Service
     ↓
 Edge Redpanda (transformed-sensor-data)
     ├──→ InfluxDB Writer → InfluxDB (7-day local)
-    └──→ Cloud Uplink ───→ Cloud Redpanda (edge-sensor-data)
+    ├──→ Cloud Uplink ───→ Cloud Redpanda (edge-sensor-data)
+    └──→ Anomaly Alert ──→ Logs (ML inference)
                               ↓
                            Cassandra Writer → Cassandra (90-day cloud)
                               ↑
                            Cloud API (REST queries)
                            Spark Job (batch ML training) → MinIO (models)
+                                                              ↓
+                                                        Anomaly Alert ← polls model updates
 ```
 
 ### Edge Components (K3s)
@@ -408,6 +411,7 @@ Edge Redpanda (transformed-sensor-data)
 | **Transformation** | Deployment + HPA | 2-30 | Data processing |
 | **InfluxDB Writer** | Deployment + HPA | 2-10 | Redpanda → InfluxDB |
 | **Cloud Uplink** | Deployment + HPA | 1-5 | Edge Redpanda → Cloud Redpanda |
+| **Anomaly Alert** | Deployment + HPA | 2-10 | Real-time ML inference (polls model every 60s) |
 | **Device Registry** | Deployment | 2 | Device management API |
 
 ### Cloud Components (Docker Compose)

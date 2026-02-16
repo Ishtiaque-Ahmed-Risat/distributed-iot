@@ -16,39 +16,46 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Build ingestion service
-echo -e "\n${YELLOW}[1/5] Building ingestion-service...${NC}"
+echo -e "\n${YELLOW}[1/6] Building ingestion-service...${NC}"
 cd services/ingestion
 docker build -t ingestion-service:latest .
 cd ../..
 echo -e "${GREEN}✓ ingestion-service built${NC}"
 
 # Build device-registry
-echo -e "\n${YELLOW}[2/5] Building device-registry...${NC}"
+echo -e "\n${YELLOW}[2/6] Building device-registry...${NC}"
 cd services/device-registry
 docker build -t device-registry:latest .
 cd ../..
 echo -e "${GREEN}✓ device-registry built${NC}"
 
 # Build transformation-service
-echo -e "\n${YELLOW}[3/5] Building transformation-service...${NC}"
+echo -e "\n${YELLOW}[3/6] Building transformation-service...${NC}"
 cd services/transformation
 docker build -t transformation-service:latest .
 cd ../..
 echo -e "${GREEN}✓ transformation-service built${NC}"
 
 # Build influxdb-writer
-echo -e "\n${YELLOW}[4/5] Building influxdb-writer...${NC}"
+echo -e "\n${YELLOW}[4/6] Building influxdb-writer...${NC}"
 cd services/influxdb-writer
 docker build -t influxdb-writer:latest .
 cd ../..
 echo -e "${GREEN}✓ influxdb-writer built${NC}"
 
 # Build cloud-uplink
-echo -e "\n${YELLOW}[5/5] Building cloud-uplink...${NC}"
+echo -e "\n${YELLOW}[5/6] Building cloud-uplink...${NC}"
 cd services/cloud-uplink
 docker build -t cloud-uplink:latest .
 cd ../..
 echo -e "${GREEN}✓ cloud-uplink built${NC}"
+
+# Build anomaly-alert
+echo -e "\n${YELLOW}[6/6] Building anomaly-alert...${NC}"
+cd services/anomaly-alert
+docker build -t anomaly-alert:latest .
+cd ../..
+echo -e "${GREEN}✓ anomaly-alert built${NC}"
 
 # Import images to K3s (if K3s is running)
 if command -v k3s &> /dev/null; then
@@ -59,6 +66,7 @@ if command -v k3s &> /dev/null; then
     docker save transformation-service:latest | sudo k3s ctr images import -
     docker save influxdb-writer:latest | sudo k3s ctr images import -
     docker save cloud-uplink:latest | sudo k3s ctr images import -
+    docker save anomaly-alert:latest | sudo k3s ctr images import -
     
     echo -e "${GREEN}✓ Images imported to K3s${NC}"
 else

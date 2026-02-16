@@ -34,6 +34,7 @@ InfluxDB Writer Service (Deployment, HPA 1-10)
 - **Data Ingestion**: MQTT→Redpanda with shared subscriptions, AP producer
 - **Data Transformation**: Unit conversion & semantic normalization
 - **InfluxDB Writer**: Batched writes to node-local InfluxDB
+- **Anomaly Alert**: Real-time ML inference, polls model from MinIO every 60s
 
 ## Quick Start
 
