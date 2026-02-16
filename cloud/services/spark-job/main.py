@@ -229,18 +229,18 @@ class BatchAnalyticsJob:
         bucket = self.config['model_bucket']
         timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
 
-        # Save model artifact
+        # Save model artifact (serialize once, use twice)
         model_buffer = io.BytesIO()
         joblib.dump(model_package['model'], model_buffer)
-        model_buffer.seek(0)
+        model_data = model_buffer.getvalue()
 
+        # Upload versioned model
         model_key = f"models/anomaly_detection/model_{timestamp}.joblib"
-        self.s3_client.upload_fileobj(model_buffer, bucket, model_key)
+        self.s3_client.upload_fileobj(io.BytesIO(model_data), bucket, model_key)
         logger.info(f"✓ Saved model to MinIO: {model_key}")
 
         # Also save as 'latest' for edge to pull
-        model_buffer.seek(0)
-        self.s3_client.upload_fileobj(model_buffer, bucket, "models/anomaly_detection/latest.joblib")
+        self.s3_client.upload_fileobj(io.BytesIO(model_data), bucket, "models/anomaly_detection/latest.joblib")
         logger.info("✓ Updated 'latest' model pointer")
 
         # Save metadata

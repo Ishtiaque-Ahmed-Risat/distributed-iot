@@ -151,6 +151,17 @@ curl http://localhost:8000/api/v1/devices/device_0000/latest
 
 If the Cloud API returns device data, **the full edge-to-cloud pipeline is working!** 🎉
 
+### Run ML Training Job (Optional)
+
+Train an anomaly detection model on historical data:
+
+```bash
+cd cloud
+docker-compose -f docker-compose.yml -f docker-compose.job.yml run --rm spark-job
+```
+
+This analyzes the last 24 hours of data, trains an Isolation Forest model, and saves it to MinIO.
+
 ---
 
 ## Accessing Services
