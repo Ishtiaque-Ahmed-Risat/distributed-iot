@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Batch Analytics & ML Training Job
-Reads historical sensor data from Cassandra, computes aggregations,
-and trains/updates an anomaly detection model.
+Batch Analytics & ML Training Job with PySpark
+Reads historical sensor data from Cassandra using Spark,
+computes aggregations, and trains an anomaly detection model.
 
 This is designed to run as a periodic job (e.g., hourly or daily).
-Currently uses plain Python with pandas/numpy for processing.
-For production scale, replace with PySpark (same logic, distributed).
+Uses PySpark for distributed processing of large datasets.
 
 Model artifacts are saved to MinIO (S3-compatible storage).
 """
@@ -17,12 +16,12 @@ import os
 import sys
 import io
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Any
+from typing import Dict, Any
 
 import numpy as np
-import pandas as pd
-from cassandra.cluster import Cluster
-from cassandra.policies import DCAwareRoundRobinPolicy
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType, BooleanType
 from sklearn.ensemble import IsolationForest
 import joblib
 import boto3
@@ -36,24 +35,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class BatchAnalyticsJob:
-    """Reads from Cassandra, computes analytics, trains ML model"""
+class SparkBatchAnalyticsJob:
+    """Reads from Cassandra using Spark, computes analytics, trains ML model"""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.session = None
+        self.spark = None
         self.s3_client = None
 
-    def setup_cassandra(self):
-        """Connect to Cassandra"""
-        hosts = self.config['cassandra_hosts']
-        cluster = Cluster(
-            hosts,
-            load_balancing_policy=DCAwareRoundRobinPolicy(local_dc='DC1'),
-            protocol_version=4
-        )
-        self.session = cluster.connect('iot_data')
-        logger.info(f"✓ Connected to Cassandra: {hosts}")
+    def setup_spark(self):
+        """Initialize Spark session with Cassandra connector"""
+        logger.info("Initializing Spark session...")
+        
+        # Download Cassandra connector if needed (handled by Spark packages)
+        self.spark = SparkSession.builder \
+            .appName("IoT-ML-Training-Job") \
+            .config("spark.master", "local[*]") \
+            .config("spark.cassandra.connection.host", self.config['cassandra_hosts'][0]) \
+            .config("spark.cassandra.connection.port", "9042") \
+            .config("spark.sql.extensions", "com.datastax.spark.connector.CassandraSparkExtensions") \
+            .config("spark.jars.packages", "com.datastax.spark:spark-cassandra-connector_2.12:3.5.0") \
+            .config("spark.driver.memory", "2g") \
+            .config("spark.executor.memory", "2g") \
+            .getOrCreate()
+        
+        # Reduce verbose logging
+        self.spark.sparkContext.setLogLevel("WARN")
+        logger.info(f"✓ Spark session initialized (version {self.spark.version})")
 
     def setup_minio(self):
         """Connect to MinIO (S3-compatible)"""
@@ -76,115 +84,117 @@ class BatchAnalyticsJob:
 
         logger.info(f"✓ Connected to MinIO: {self.config['minio_endpoint']}")
 
-    def fetch_data(self, hours_back: int = 24) -> pd.DataFrame:
+    def fetch_data(self, hours_back: int = 24):
         """
-        Fetch recent sensor data from Cassandra.
-        Reads from time-bucketed partitions for efficiency.
+        Fetch recent sensor data from Cassandra using Spark.
+        Returns a Spark DataFrame.
         """
         now = datetime.now(timezone.utc)
         start_time = now - timedelta(hours=hours_back)
 
-        # Get date buckets to query
-        dates = []
-        d = start_time.date()
-        while d <= now.date():
-            dates.append(d.strftime('%Y-%m-%d'))
-            d += timedelta(days=1)
+        logger.info(f"Fetching data from Cassandra (last {hours_back} hours)...")
 
-        # Get list of devices
-        device_rows = self.session.execute(
-            "SELECT DISTINCT device_id FROM device_latest"
+        # Read from Cassandra using Spark
+        df = self.spark.read \
+            .format("org.apache.spark.sql.cassandra") \
+            .options(table="sensor_readings", keyspace="iot_data") \
+            .load()
+
+        # Filter by timestamp
+        df = df.filter(
+            (F.col("timestamp") >= start_time) & 
+            (F.col("timestamp") <= now)
         )
-        devices = [r.device_id for r in device_rows]
 
-        if not devices:
-            logger.warning("No devices found in Cassandra")
-            return pd.DataFrame()
-
-        logger.info(f"Fetching data for {len(devices)} devices, {len(dates)} date buckets")
-
-        all_rows = []
-        for device_id in devices:
-            for dt in dates:
-                rows = self.session.execute(
-                    "SELECT device_id, timestamp, sensor_type, value, unit, is_anomaly "
-                    "FROM sensor_readings "
-                    "WHERE device_id = %s AND date = %s "
-                    "AND timestamp >= %s AND timestamp <= %s",
-                    (device_id, dt, start_time, now)
-                )
-                for row in rows:
-                    all_rows.append({
-                        'device_id': row.device_id,
-                        'timestamp': row.timestamp,
-                        'sensor_type': row.sensor_type,
-                        'value': row.value,
-                        'unit': row.unit,
-                        'is_anomaly': row.is_anomaly
-                    })
-
-        df = pd.DataFrame(all_rows)
-        logger.info(f"Fetched {len(df)} records from Cassandra")
+        count = df.count()
+        logger.info(f"Fetched {count} records from Cassandra")
+        
+        if count == 0:
+            logger.warning("No data found in the specified time range")
+        
         return df
 
-    def compute_aggregations(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Compute per-device, per-sensor aggregations"""
-        if df.empty:
+    def compute_aggregations(self, df):
+        """
+        Compute per-device, per-sensor aggregations using Spark.
+        Returns a Python dict with aggregation results.
+        """
+        if df.rdd.isEmpty():
             return {}
 
+        logger.info("Computing aggregations with Spark...")
+
+        # Group by device_id and sensor_type, compute stats
+        agg_df = df.groupBy("device_id", "sensor_type").agg(
+            F.count("value").alias("count"),
+            F.mean("value").alias("mean"),
+            F.stddev("value").alias("std"),
+            F.min("value").alias("min"),
+            F.max("value").alias("max"),
+            F.expr("percentile_approx(value, 0.5)").alias("median"),
+            F.expr("percentile_approx(value, 0.95)").alias("p95"),
+            F.expr("percentile_approx(value, 0.05)").alias("p05")
+        )
+
+        # Collect results (this is small - one row per device/sensor combo)
+        results = agg_df.collect()
+        
         stats = {}
-        for (device_id, sensor_type), group in df.groupby(['device_id', 'sensor_type']):
-            key = f"{device_id}/{sensor_type}"
-            values = group['value']
+        for row in results:
+            key = f"{row.device_id}/{row.sensor_type}"
             stats[key] = {
-                'device_id': device_id,
-                'sensor_type': sensor_type,
-                'count': len(values),
-                'mean': float(values.mean()),
-                'std': float(values.std()) if len(values) > 1 else 0.0,
-                'min': float(values.min()),
-                'max': float(values.max()),
-                'median': float(values.median()),
-                'p95': float(values.quantile(0.95)),
-                'p05': float(values.quantile(0.05)),
+                'device_id': row.device_id,
+                'sensor_type': row.sensor_type,
+                'count': int(row['count']),
+                'mean': float(row['mean']) if row['mean'] is not None else 0.0,
+                'std': float(row['std']) if row['std'] is not None else 0.0,
+                'min': float(row['min']) if row['min'] is not None else 0.0,
+                'max': float(row['max']) if row['max'] is not None else 0.0,
+                'median': float(row['median']) if row['median'] is not None else 0.0,
+                'p95': float(row['p95']) if row['p95'] is not None else 0.0,
+                'p05': float(row['p05']) if row['p05'] is not None else 0.0,
             }
 
         logger.info(f"Computed aggregations for {len(stats)} device/sensor combinations")
         return stats
 
-    def train_anomaly_model(self, df: pd.DataFrame) -> Any:
+    def train_anomaly_model(self, df):
         """
         Train an Isolation Forest anomaly detection model.
-        Each device+sensor gets features: value, rolling mean, rolling std.
-
-        This is the ML abstraction point — replace with any model:
-        - LSTM autoencoder for temporal anomalies
-        - Prophet for trend anomalies
-        - Custom deep learning model
+        Uses Spark for data preparation, sklearn for model training.
         """
-        if df.empty or len(df) < 10:
-            logger.warning("Not enough data to train model")
+        if df.rdd.isEmpty():
+            logger.warning("No data available for training")
+            return None
+
+        count = df.count()
+        if count < 10:
+            logger.warning(f"Not enough data to train model (only {count} records)")
             return None
 
         logger.info("Training anomaly detection model (IsolationForest)...")
 
-        # Pivot: one row per timestamp per device, features = sensor values
-        pivot = df.pivot_table(
-            index=['device_id', 'timestamp'],
-            columns='sensor_type',
-            values='value',
-            aggfunc='first'
-        ).reset_index()
+        # Pivot data: each row is (device_id, timestamp) with sensor values as columns
+        pivot_df = df.groupBy("device_id", "timestamp").pivot("sensor_type").agg(
+            F.first("value")
+        )
 
-        # Fill NaN with column mean
-        feature_cols = [c for c in pivot.columns if c not in ['device_id', 'timestamp']]
-        pivot[feature_cols] = pivot[feature_cols].fillna(pivot[feature_cols].mean())
-
+        # Get feature columns (sensor types)
+        feature_cols = [col for col in pivot_df.columns if col not in ['device_id', 'timestamp']]
+        
         if not feature_cols:
-            logger.warning("No feature columns found")
+            logger.warning("No feature columns found after pivot")
             return None
 
-        X = pivot[feature_cols].values
+        logger.info(f"Training on {count} samples with {len(feature_cols)} features: {feature_cols}")
+
+        # Fill nulls with 0 (or could use mean)
+        for col in feature_cols:
+            pivot_df = pivot_df.fillna({col: 0.0})
+
+        # Collect feature data to numpy array for sklearn
+        # For huge datasets, you'd use Spark ML instead, but sklearn is simpler
+        feature_data = pivot_df.select(feature_cols).toPandas().values
 
         # Train Isolation Forest
         model = IsolationForest(
@@ -193,24 +203,24 @@ class BatchAnalyticsJob:
             random_state=42,
             n_jobs=-1
         )
-        model.fit(X)
+        model.fit(feature_data)
 
         # Score the training data
-        scores = model.decision_function(X)
-        predictions = model.predict(X)
+        scores = model.decision_function(feature_data)
+        predictions = model.predict(feature_data)
         n_anomalies = (predictions == -1).sum()
 
         logger.info(
-            f"Model trained on {len(X)} samples, {len(feature_cols)} features. "
-            f"Detected {n_anomalies} anomalies ({100*n_anomalies/len(X):.1f}%)"
+            f"Model trained on {len(feature_data)} samples, {len(feature_cols)} features. "
+            f"Detected {n_anomalies} anomalies ({100*n_anomalies/len(feature_data):.1f}%)"
         )
 
         # Package model with metadata
         model_package = {
             'model': model,
             'feature_columns': feature_cols,
-            'training_samples': len(X),
-            'anomaly_ratio': float(n_anomalies / len(X)),
+            'training_samples': len(feature_data),
+            'anomaly_ratio': float(n_anomalies / len(feature_data)),
             'trained_at': datetime.now(timezone.utc).isoformat(),
             'score_stats': {
                 'mean': float(scores.mean()),
@@ -272,7 +282,7 @@ class BatchAnalyticsJob:
     def run(self):
         """Execute the batch job"""
         logger.info("=" * 50)
-        logger.info("Batch Analytics & ML Training Job")
+        logger.info("Batch Analytics & ML Training Job (PySpark)")
         logger.info("=" * 50)
         logger.info(f"[CONFIG] Cassandra: {self.config['cassandra_hosts']}")
         logger.info(f"[CONFIG] MinIO: {self.config['minio_endpoint']}")
@@ -281,32 +291,39 @@ class BatchAnalyticsJob:
         start_time = datetime.now(timezone.utc)
 
         # Setup connections
-        self.setup_cassandra()
+        self.setup_spark()
         self.setup_minio()
 
-        # Step 1: Fetch data
-        logger.info("\n--- Step 1: Fetching data from Cassandra ---")
-        df = self.fetch_data(hours_back=self.config['hours_back'])
+        try:
+            # Step 1: Fetch data
+            logger.info("\n--- Step 1: Fetching data from Cassandra ---")
+            df = self.fetch_data(hours_back=self.config['hours_back'])
 
-        if df.empty:
-            logger.info("No data found. Exiting.")
-            return
+            if df.rdd.isEmpty():
+                logger.info("No data found. Exiting.")
+                return
 
-        # Step 2: Compute aggregations
-        logger.info("\n--- Step 2: Computing aggregations ---")
-        stats = self.compute_aggregations(df)
-        self.save_stats_to_minio(stats)
+            # Step 2: Compute aggregations
+            logger.info("\n--- Step 2: Computing aggregations ---")
+            stats = self.compute_aggregations(df)
+            self.save_stats_to_minio(stats)
 
-        # Step 3: Train anomaly detection model
-        logger.info("\n--- Step 3: Training anomaly detection model ---")
-        model_package = self.train_anomaly_model(df)
-        self.save_model_to_minio(model_package)
+            # Step 3: Train anomaly detection model
+            logger.info("\n--- Step 3: Training anomaly detection model ---")
+            model_package = self.train_anomaly_model(df)
+            self.save_model_to_minio(model_package)
 
-        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-        logger.info(f"\n{'=' * 50}")
-        logger.info(f"Job completed in {elapsed:.1f}s")
-        logger.info(f"Records processed: {len(df)}")
-        logger.info(f"{'=' * 50}")
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+            logger.info(f"\n{'=' * 50}")
+            logger.info(f"Job completed in {elapsed:.1f}s")
+            logger.info(f"Records processed: {df.count()}")
+            logger.info(f"{'=' * 50}")
+
+        finally:
+            # Always stop Spark session
+            if self.spark:
+                self.spark.stop()
+                logger.info("Spark session stopped")
 
 
 def main():
@@ -319,12 +336,12 @@ def main():
         'hours_back': int(os.getenv('HOURS_BACK', '24')),
     }
 
-    job = BatchAnalyticsJob(config)
+    job = SparkBatchAnalyticsJob(config)
 
     try:
         job.run()
     except Exception as e:
-        logger.error(f"Job failed: {e}")
+        logger.error(f"Job failed: {e}", exc_info=True)
         sys.exit(1)
 
 
