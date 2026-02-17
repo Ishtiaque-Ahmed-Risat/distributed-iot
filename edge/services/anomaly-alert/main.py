@@ -155,7 +155,7 @@ class AnomalyAlertService:
         self.current_model_version = None
         self.s3_client = None
         self.consumer = None
-        self.should_restart = False
+        self.model_lock = threading.Lock()  # For atomic model updates
         self.sensor_buffer = SensorBuffer(
             window_seconds=self.config['buffer_window'],
             max_buffer_size=self.config['max_buffer_size']
@@ -174,7 +174,7 @@ class AnomalyAlertService:
         logger.info(f"✓ Connected to MinIO: {self.config['minio_endpoint']}")
 
     def download_model(self) -> bool:
-        """Download latest model from MinIO"""
+        """Download and hot-swap model from MinIO atomically"""
         try:
             bucket = self.config['model_bucket']
             
@@ -195,7 +195,8 @@ class AnomalyAlertService:
                 logger.debug(f"Model already up to date: {model_version}")
                 return False
             
-            # Download model
+            # Download model to temporary buffer
+            logger.info(f"Downloading new model version: {model_version}")
             model_buffer = io.BytesIO()
             self.s3_client.download_fileobj(
                 bucket,
@@ -204,45 +205,55 @@ class AnomalyAlertService:
             )
             model_buffer.seek(0)
             
-            # Load model
+            # Load new model (outside lock, takes time)
             new_model = joblib.load(model_buffer)
+            new_features = metadata.get('feature_columns', [])
+            new_metadata = metadata
             
-            # Update state
-            self.model = new_model
-            self.feature_columns = metadata.get('feature_columns', [])
-            self.model_metadata = metadata
+            # Atomic swap with lock (very brief lock time)
+            with self.model_lock:
+                old_version = self.current_model_version
+                self.model = new_model
+                self.feature_columns = new_features
+                self.model_metadata = new_metadata
+                self.current_model_version = model_version
             
-            if self.current_model_version is None:
-                logger.info(f"✓ Loaded model: {model_version}")
-                logger.info(f"  Features: {self.feature_columns}")
+            # Log update (outside lock)
+            if old_version is None:
+                logger.info(f"✓ Loaded initial model: {model_version}")
+                logger.info(f"  Features: {new_features}")
                 logger.info(f"  Training samples: {metadata.get('training_samples', 'N/A')}")
                 logger.info(f"  Anomaly ratio: {metadata.get('anomaly_ratio', 'N/A'):.2%}")
             else:
-                logger.warning(f"🔄 Model updated: {self.current_model_version} → {model_version}")
-                self.should_restart = True
+                logger.warning(f"🔄 Model updated: {old_version} → {model_version}")
             
-            self.current_model_version = model_version
             return True
             
         except Exception as e:
-            logger.error(f"Failed to download model: {e}")
+            logger.error(f"Failed to download/swap model: {e}")
             if self.model is None:
                 raise RuntimeError("No model available, cannot start")
+            # Keep old model on failure
+            logger.warning("Keeping previous model version")
             return False
 
     def model_update_loop(self):
-        """Background thread to check for model updates"""
+        """Background thread to check for model updates and hot-swap"""
         logger.info(f"Model update checker started (interval: {self.config['update_interval']}s)")
         
-        while not self.should_restart:
+        # Add initial random delay to stagger checks across replicas (0-30s)
+        # Reduces MinIO load spikes when multiple pods check simultaneously
+        import random
+        initial_delay = random.uniform(0, 30)
+        logger.info(f"Initial delay: {initial_delay:.1f}s (staggers checks across replicas)")
+        time.sleep(initial_delay)
+        
+        while True:  # Run forever, no restart needed
             time.sleep(self.config['update_interval'])
             try:
-                self.download_model()
-                if self.should_restart:
-                    logger.warning("Model updated - triggering graceful restart...")
-                    # Give consumer time to commit offsets
-                    time.sleep(5)
-                    os._exit(0)  # Kubernetes will restart the pod
+                updated = self.download_model()
+                if updated:
+                    logger.info("Model update complete - continuing inference with new model")
             except Exception as e:
                 logger.error(f"Model update check failed: {e}")
 
@@ -264,11 +275,15 @@ class AnomalyAlertService:
         logger.info(f"  Consumer group: {self.config['consumer_group']}")
 
     def prepare_features(self, feature_dict: Dict[str, float]) -> Optional[np.ndarray]:
-        """Convert feature dictionary to numpy array in correct order"""
+        """Convert feature dictionary to numpy array in correct order (thread-safe)"""
         try:
+            # Get feature columns under lock
+            with self.model_lock:
+                feature_columns = self.feature_columns.copy()
+            
             # Build feature vector in the same order as training
             features = []
-            for feature_name in self.feature_columns:
+            for feature_name in feature_columns:
                 value = feature_dict.get(feature_name)
                 if value is None:
                     logger.warning(f"Missing feature '{feature_name}' in aggregated data")
@@ -282,23 +297,29 @@ class AnomalyAlertService:
             return None
 
     def run_inference(self, device_id: str, feature_dict: Dict[str, float], timestamp: str) -> Optional[Dict[str, Any]]:
-        """Run anomaly detection on aggregated features"""
-        if self.model is None:
-            return None
+        """Run anomaly detection on aggregated features (thread-safe)"""
+        # Acquire lock briefly to get consistent model snapshot
+        with self.model_lock:
+            if self.model is None:
+                return None
+            # Get references under lock
+            model = self.model
+            metadata = self.model_metadata
         
+        # Run inference outside lock (time-consuming)
         features = self.prepare_features(feature_dict)
         if features is None:
             return None
         
         try:
             # Predict: 1 = normal, -1 = anomaly
-            prediction = self.model.predict(features)[0]
-            score = self.model.decision_function(features)[0]
+            prediction = model.predict(features)[0]
+            score = model.decision_function(features)[0]
             
             return {
                 'is_anomaly': prediction == -1,
                 'anomaly_score': float(score),
-                'threshold': self.model_metadata.get('score_stats', {}).get('threshold', 0.0),
+                'threshold': metadata.get('score_stats', {}).get('threshold', 0.0),
                 'device_id': device_id,
                 'features': feature_dict,
                 'timestamp': timestamp
