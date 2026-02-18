@@ -232,7 +232,11 @@ class AnomalyAlertService:
         except Exception as e:
             logger.error(f"Failed to download/swap model: {e}")
             if self.model is None:
-                raise RuntimeError("No model available, cannot start")
+                # No model yet - log warning
+                logger.warning("⚠️  No model available in MinIO yet")
+                logger.warning("   Service will run in pass-through mode (no inference)")
+                logger.warning("   Waiting for model to be trained and uploaded...")
+                return False
             # Keep old model on failure
             logger.warning("Keeping previous model version")
             return False
@@ -373,7 +377,12 @@ class AnomalyAlertService:
         
         # Setup connections
         self.setup_minio()
-        self.download_model()
+        
+        # Try to download model (don't crash if not available)
+        has_model = self.download_model()
+        if not has_model:
+            logger.warning("⚠️  Starting without ML model - will retry every 60s")
+        
         self.setup_kafka()
         
         # Start model update checker in background
@@ -381,7 +390,10 @@ class AnomalyAlertService:
         update_thread.start()
         
         logger.info("=" * 60)
-        logger.info("🚀 Ready to process messages")
+        if has_model:
+            logger.info("🚀 Ready to process messages with ML inference")
+        else:
+            logger.info("🚀 Ready to process messages (pass-through mode, waiting for model)")
         logger.info(f"   Buffer window: {self.config['buffer_window']}s")
         logger.info(f"   Max buffer size: {self.config['max_buffer_size']} devices")
         logger.info("=" * 60)
