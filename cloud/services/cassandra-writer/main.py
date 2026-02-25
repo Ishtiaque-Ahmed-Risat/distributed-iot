@@ -94,33 +94,49 @@ class CassandraWriterService:
             logger.error(f"Failed to connect to Redpanda: {e}")
             raise
 
-    def write_batch(self, records: List[Dict[str, Any]]):
-        """Write a batch of records to Cassandra using unlogged batch per partition"""
-        if not records:
-            return
+    def _write_single_record(self, record: Dict[str, Any]) -> bool:
+        """
+        Write a single record to Cassandra.
+        Returns True if successful, False otherwise.
+        Logs a warning on failure.
+        """
+        try:
+            # Prepare data - wrap in try-except to catch any data preparation errors
+            try:
+                ts = datetime.fromtimestamp(record['timestamp'], tz=timezone.utc)
+                date_str = ts.strftime('%Y-%m-%d')
+            except (ValueError, OverflowError, OSError, KeyError, TypeError) as e:
+                logger.warning(
+                    f"Skipping record due to invalid timestamp: device_id={record.get('device_id')}, "
+                    f"timestamp={record.get('timestamp')}, error={e}"
+                )
+                return False
 
-        # Group records by partition key (device_id, date) for efficient batching
-        partitions: Dict[tuple, list] = {}
-        for record in records:
-            ts = datetime.fromtimestamp(record['timestamp'], tz=timezone.utc)
-            date_str = ts.strftime('%Y-%m-%d')
-            key = (record['device_id'], date_str)
-            if key not in partitions:
-                partitions[key] = []
-            partitions[key].append((record, ts, date_str))
-
-        # Write each partition group as an unlogged batch (single partition = efficient)
-        for (device_id, date_str), group in partitions.items():
-            batch = BatchStatement(batch_type=BatchType.UNLOGGED)
-
-            for record, ts, ds in group:
+            # Prepare metadata
+            try:
                 metadata_map = {}
                 if record.get('metadata') and isinstance(record['metadata'], dict):
                     metadata_map = {str(k): str(v) for k, v in record['metadata'].items()}
+            except Exception as e:
+                logger.warning(
+                    f"Skipping record due to metadata processing error: device_id={record.get('device_id')}, "
+                    f"error={e}"
+                )
+                return False
 
-                batch.add(self.insert_reading_stmt, (
-                    record['device_id'],
-                    ds,
+            # Validate required fields
+            device_id = record.get('device_id')
+            if not device_id:
+                logger.warning(
+                    f"Skipping record due to missing device_id: record={record}"
+                )
+                return False
+
+            # Prepare values - catch any type conversion errors
+            try:
+                insert_params = (
+                    device_id,
+                    date_str,
                     ts,
                     record.get('sensor_type', 'unknown'),
                     float(record.get('value', 0)),
@@ -129,43 +145,145 @@ class CassandraWriterService:
                     record.get('original_unit', record.get('unit', '')),
                     bool(record.get('is_anomaly', False)),
                     metadata_map
-                ))
+                )
 
-                # Also update latest reading
-                batch.add(self.update_latest_stmt, (
-                    record['device_id'],
+                latest_params = (
+                    device_id,
                     record.get('sensor_type', 'unknown'),
                     ts,
                     float(record.get('value', 0)),
                     record.get('unit', ''),
                     bool(record.get('is_anomaly', False))
-                ))
+                )
+            except (ValueError, TypeError, KeyError) as e:
+                logger.warning(
+                    f"Skipping record due to data conversion error: device_id={record.get('device_id')}, "
+                    f"error={e}"
+                )
+                return False
 
+            # Execute database writes
+            try:
+                self.session.execute(self.insert_reading_stmt, insert_params)
+                self.session.execute(self.update_latest_stmt, latest_params)
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"Skipping record due to database write error: device_id={record.get('device_id')}, "
+                    f"sensor_type={record.get('sensor_type')}, timestamp={ts}, error={e}"
+                )
+                return False
+
+        except Exception as e:
+            # Catch-all for any unexpected errors
+            logger.warning(
+                f"Skipping record due to unexpected error: device_id={record.get('device_id')}, "
+                f"error={e}"
+            )
+            return False
+
+    def write_batch(self, records: List[Dict[str, Any]]):
+        """Write a batch of records to Cassandra using unlogged batch per partition"""
+        if not records:
+            return
+
+        # Group records by partition key (device_id, date) for efficient batching
+        partitions: Dict[tuple, list] = {}
+        skipped_prep = 0
+        
+        for record in records:
+            # Validate required fields
+            device_id = record.get('device_id')
+            if not device_id:
+                skipped_prep += 1
+                logger.warning(
+                    f"Skipping record during batch preparation: missing device_id, record={record}"
+                )
+                continue
+                
+            try:
+                ts = datetime.fromtimestamp(record.get('timestamp'), tz=timezone.utc)
+                date_str = ts.strftime('%Y-%m-%d')
+                key = (device_id, date_str)
+                if key not in partitions:
+                    partitions[key] = []
+                partitions[key].append((record, ts, date_str))
+            except (ValueError, OverflowError, OSError, KeyError, TypeError) as e:
+                # Skip records that fail during preparation
+                skipped_prep += 1
+                logger.warning(
+                    f"Skipping record during batch preparation: device_id={device_id}, "
+                    f"timestamp={record.get('timestamp')}, error={e}"
+                )
+                continue
+
+        if skipped_prep > 0:
+            logger.warning(f"Skipped {skipped_prep} records during batch preparation")
+
+        # Write each partition group as an unlogged batch (single partition = efficient)
+        successful_writes = 0
+        for (device_id, date_str), group in partitions.items():
+            batch = BatchStatement(batch_type=BatchType.UNLOGGED)
+            batch_records = []
+
+            for record, ts, ds in group:
+                try:
+                    device_id = record.get('device_id')
+                    if not device_id:
+                        logger.warning(
+                            f"Skipping record during batch preparation: missing device_id"
+                        )
+                        continue
+                        
+                    metadata_map = {}
+                    if record.get('metadata') and isinstance(record['metadata'], dict):
+                        metadata_map = {str(k): str(v) for k, v in record['metadata'].items()}
+
+                    batch.add(self.insert_reading_stmt, (
+                        device_id,
+                        ds,
+                        ts,
+                        record.get('sensor_type', 'unknown'),
+                        float(record.get('value', 0)),
+                        record.get('unit', ''),
+                        float(record.get('original_value', record.get('value', 0))),
+                        record.get('original_unit', record.get('unit', '')),
+                        bool(record.get('is_anomaly', False)),
+                        metadata_map
+                    ))
+
+                    # Also update latest reading
+                    batch.add(self.update_latest_stmt, (
+                        device_id,
+                        record.get('sensor_type', 'unknown'),
+                        ts,
+                        float(record.get('value', 0)),
+                        record.get('unit', ''),
+                        bool(record.get('is_anomaly', False))
+                    ))
+                    batch_records.append(record)
+                except (ValueError, TypeError, KeyError) as e:
+                    logger.warning(
+                        f"Skipping record during batch preparation: device_id={record.get('device_id')}, "
+                        f"error={e}"
+                    )
+                    continue
+
+            if not batch_records:
+                continue
+
+            # Try batch write first
             try:
                 self.session.execute(batch)
+                successful_writes += len(batch_records)
             except Exception as e:
-                logger.error(f"Failed to write batch for {device_id}/{date_str}: {e}")
-                # Try individual writes as fallback
-                for record, ts, ds in group:
-                    try:
-                        metadata_map = {}
-                        if record.get('metadata') and isinstance(record['metadata'], dict):
-                            metadata_map = {str(k): str(v) for k, v in record['metadata'].items()}
+                logger.warning(f"Batch write failed for {device_id}/{date_str}: {e}, trying individual writes")
+                # Fallback to individual writes
+                for record in batch_records:
+                    if self._write_single_record(record):
+                        successful_writes += 1
 
-                        self.session.execute(self.insert_reading_stmt, (
-                            record['device_id'], ds, ts,
-                            record.get('sensor_type', 'unknown'),
-                            float(record.get('value', 0)),
-                            record.get('unit', ''),
-                            float(record.get('original_value', record.get('value', 0))),
-                            record.get('original_unit', record.get('unit', '')),
-                            bool(record.get('is_anomaly', False)),
-                            metadata_map
-                        ))
-                    except Exception as inner_e:
-                        logger.error(f"Individual write failed: {inner_e}")
-
-        self.write_count += len(records)
+        self.write_count += successful_writes
 
     def start(self):
         """Start the writer service"""
@@ -186,19 +304,28 @@ class CassandraWriterService:
 
         try:
             while self.running:
-                records = self.consumer.poll(
-                    timeout_ms=1000,
-                    max_records=self.config['batch_size']
-                )
+                try:
+                    records = self.consumer.poll(
+                        timeout_ms=1000,
+                        max_records=self.config['batch_size']
+                    )
 
-                # Flatten messages
-                messages = []
-                for tp, msgs in records.items():
-                    for msg in msgs:
-                        messages.append(msg.value)
+                    # Flatten messages
+                    messages = []
+                    for tp, msgs in records.items():
+                        for msg in msgs:
+                            try:
+                                if msg.value:
+                                    messages.append(msg.value)
+                            except Exception as e:
+                                logger.warning(f"Error processing message from {tp}: {e}, skipping message")
 
-                if messages:
-                    self.buffer.extend(messages)
+                    if messages:
+                        self.buffer.extend(messages)
+                except Exception as e:
+                    logger.warning(f"Error polling messages: {e}, continuing...")
+                    time.sleep(1)  # Brief pause before retrying
+                    continue
 
                 # Flush if buffer full or time elapsed
                 now = time.time()
@@ -206,14 +333,41 @@ class CassandraWriterService:
                 time_elapsed = (now - self.last_flush_time) >= self.config['flush_interval']
 
                 if self.buffer and (buffer_full or time_elapsed):
-                    self.write_batch(self.buffer)
-                    self.consumer.commit()
-                    logger.info(
-                        f"[INFO] Wrote {len(self.buffer)} records to Cassandra "
-                        f"(Total: {self.write_count})"
-                    )
-                    self.buffer.clear()
-                    self.last_flush_time = now
+                    try:
+                        buffer_size = len(self.buffer)
+                        # Store original count before write_batch modifies write_count
+                        write_count_before = self.write_count
+                        self.write_batch(self.buffer)
+                        successful_count = self.write_count - write_count_before
+                        
+                        # Only commit if we successfully wrote at least some records
+                        if successful_count > 0:
+                            self.consumer.commit()
+                            logger.info(
+                                f"[INFO] Processed {buffer_size} records to Cassandra "
+                                f"(Successfully wrote: {successful_count}, Total: {self.write_count})"
+                            )
+                            # Only clear successfully processed records
+                            # Keep failed records in buffer for potential retry (but clear to avoid infinite loop)
+                            # In production, you might want a dead-letter queue here
+                            self.buffer.clear()
+                            self.last_flush_time = now
+                        else:
+                            # All records failed - don't commit, but clear buffer to avoid infinite retry
+                            logger.warning(
+                                f"All {buffer_size} records in batch failed to write. "
+                                "Clearing buffer to prevent infinite retry."
+                            )
+                            self.buffer.clear()
+                    except Exception as e:
+                        logger.warning(
+                            f"Error writing batch to database: {e}, skipping batch. "
+                            f"Buffer had {len(self.buffer)} records."
+                        )
+                        # Clear buffer to prevent infinite retry of bad data
+                        # In production, consider a dead-letter queue
+                        self.buffer.clear()
+                        # Don't commit on error - will retry on next poll
 
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt")
