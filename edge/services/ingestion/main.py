@@ -8,6 +8,7 @@ Subscribes to MQTT sensor topics and publishes to Redpanda
 import json
 import logging
 import os
+import uuid
 import signal
 import sys
 from typing import Dict, Any
@@ -147,11 +148,11 @@ class IngestionService:
         # Create client with unique ID per pod for shared subscriptions
         # Unique client_id allows multiple ingestion replicas to connect simultaneously
         import os
-        client_id = f"ingestion-{os.getpid()}"
+        client_id = f"ingestion-{uuid.uuid4()}"
         
         self.mqtt_client = mqtt.Client(
             client_id=client_id,
-            clean_session=False  # Preserve session for QoS 1 guarantees
+            clean_session=True
         )
         logger.info(f"MQTT Client ID: {client_id}")
         
