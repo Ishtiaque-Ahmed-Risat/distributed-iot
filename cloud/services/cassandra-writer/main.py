@@ -62,6 +62,13 @@ class CassandraWriterService:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """)
             self.insert_reading_stmt.consistency_level = ConsistencyLevel.LOCAL_ONE
+            
+            self.insert_reading_stmt = self.session.prepare("""
+                INSERT INTO sensor_readings_v3
+                    (device_id, date, timestamp, event_id, sensor_type, value, unit,
+                    original_value, original_unit, is_anomaly, metadata)
+                VALUES (?, ?, ?, now(), ?, ?, ?, ?, ?, ?, ?)
+            """)
 
             self.update_latest_stmt = self.session.prepare("""
                 INSERT INTO device_latest

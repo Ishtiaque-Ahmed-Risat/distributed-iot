@@ -181,7 +181,6 @@ class IngestionService:
                 
                 # Timeouts
                 request_timeout_ms=10000,  # 10s request timeout
-                delivery_timeout_ms=30000,  # 30s total delivery timeout
                 
                 # Performance optimizations
                 compression_type='lz4',  # Fast compression
