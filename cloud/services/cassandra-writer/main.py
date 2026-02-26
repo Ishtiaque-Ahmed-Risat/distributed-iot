@@ -35,12 +35,17 @@ class CassandraWriterService:
         self.consumer = None
         self.cassandra_cluster = None
         self.session = None
-        self.insert_reading_stmt = None
+        self.insert_reading_v1_stmt = None
+        self.insert_reading_v3_stmt = None
         self.update_latest_stmt = None
         self.write_count = 0
         self.running = False
         self.last_flush_time = time.time()
         self.buffer: List[Dict[str, Any]] = []
+
+        # Write 1 row to sensor_readings for every N rows written to sensor_readings_v3
+        self.sensor_readings_sample_every = int(self.config.get('sensor_readings_sample_every', 100))
+        self._sensor_readings_seen = 0
 
     def setup_cassandra(self):
         """Initialize Cassandra connection and prepared statements"""
@@ -55,20 +60,23 @@ class CassandraWriterService:
             logger.info(f"✓ Connected to Cassandra: {hosts}")
 
             # Prepare statements for performance
-            self.insert_reading_stmt = self.session.prepare("""
+            # sensor_readings (legacy table) - sampled writes
+            self.insert_reading_v1_stmt = self.session.prepare("""
                 INSERT INTO sensor_readings
                     (device_id, date, timestamp, sensor_type, value, unit,
                      original_value, original_unit, is_anomaly, metadata)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """)
-            self.insert_reading_stmt.consistency_level = ConsistencyLevel.LOCAL_ONE
-            
-            self.insert_reading_stmt = self.session.prepare("""
+            self.insert_reading_v1_stmt.consistency_level = ConsistencyLevel.LOCAL_ONE
+
+            # sensor_readings_v3 (main table) - full writes
+            self.insert_reading_v3_stmt = self.session.prepare("""
                 INSERT INTO sensor_readings_v3
                     (device_id, date, timestamp, event_id, sensor_type, value, unit,
                     original_value, original_unit, is_anomaly, metadata)
                 VALUES (?, ?, ?, now(), ?, ?, ?, ?, ?, ?, ?)
             """)
+            self.insert_reading_v3_stmt.consistency_level = ConsistencyLevel.LOCAL_ONE
 
             self.update_latest_stmt = self.session.prepare("""
                 INSERT INTO device_latest
@@ -171,7 +179,17 @@ class CassandraWriterService:
 
             # Execute database writes
             try:
-                self.session.execute(self.insert_reading_stmt, insert_params)
+                # Always write full-fidelity record to v3
+                self.session.execute(self.insert_reading_v3_stmt, insert_params)
+
+                # Write a sampled copy to legacy table (v1)
+                self._sensor_readings_seen += 1
+                if self.sensor_readings_sample_every > 0 and (
+                    self._sensor_readings_seen % self.sensor_readings_sample_every == 0
+                ):
+                    self.session.execute(self.insert_reading_v1_stmt, insert_params)
+
+                # Also update latest reading
                 self.session.execute(self.update_latest_stmt, latest_params)
                 return True
             except Exception as e:
@@ -190,105 +208,188 @@ class CassandraWriterService:
             return False
 
     def write_batch(self, records: List[Dict[str, Any]]):
-        """Write a batch of records to Cassandra using unlogged batch per partition"""
+        """
+        Write a batch of records to Cassandra.
+
+        Behavior:
+        - Always write all records to sensor_readings_v3 (batched by partition (device_id, date)).
+        - Update device_latest per record (individual writes to avoid huge/cross-partition batches).
+        - Write 1 sampled row to sensor_readings (legacy) for every N successful v3 writes.
+            Sampling is applied ONLY after a successful v3 write so it cannot be "lost" on batch failure.
+        """
         if not records:
             return
 
-        # Group records by partition key (device_id, date) for efficient batching
+        # Group by v3 partition key: (device_id, date) where date is Cassandra 'date' (python datetime.date)
         partitions: Dict[tuple, list] = {}
         skipped_prep = 0
-        
+
         for record in records:
-            # Validate required fields
-            device_id = record.get('device_id')
+            device_id = record.get("device_id")
             if not device_id:
                 skipped_prep += 1
-                logger.warning(
-                    f"Skipping record during batch preparation: missing device_id, record={record}"
-                )
+                logger.warning(f"Skipping record: missing device_id, record={record}")
                 continue
-                
+
             try:
-                ts = datetime.fromtimestamp(record.get('timestamp'), tz=timezone.utc)
-                date_str = ts.strftime('%Y-%m-%d')
-                key = (device_id, date_str)
-                if key not in partitions:
-                    partitions[key] = []
-                partitions[key].append((record, ts, date_str))
-            except (ValueError, OverflowError, OSError, KeyError, TypeError) as e:
-                # Skip records that fail during preparation
+                ts = datetime.fromtimestamp(record.get("timestamp"), tz=timezone.utc)
+                date_val = ts.date()                  # for sensor_readings_v3 (date type)
+                date_str = ts.strftime("%Y-%m-%d")    # for sensor_readings (text type)
+            except Exception as e:
                 skipped_prep += 1
                 logger.warning(
-                    f"Skipping record during batch preparation: device_id={device_id}, "
-                    f"timestamp={record.get('timestamp')}, error={e}"
+                    f"Skipping record: bad timestamp device_id={device_id}, ts={record.get('timestamp')}, err={e}"
                 )
                 continue
 
-        if skipped_prep > 0:
+            key = (device_id, date_val)
+            partitions.setdefault(key, []).append((record, ts, date_val, date_str))
+
+        if skipped_prep:
             logger.warning(f"Skipped {skipped_prep} records during batch preparation")
 
-        # Write each partition group as an unlogged batch (single partition = efficient)
         successful_writes = 0
-        for (device_id, date_str), group in partitions.items():
-            batch = BatchStatement(batch_type=BatchType.UNLOGGED)
-            batch_records = []
 
-            for record, ts, ds in group:
+        # Helper: build params safely
+        def _build_metadata_map(r: Dict[str, Any]) -> Dict[str, str]:
+            md = r.get("metadata")
+            if md and isinstance(md, dict):
+                return {str(k): str(v) for k, v in md.items()}
+            return {}
+
+        for (device_id, date_val), group in partitions.items():
+            # Batch ONLY v3 inserts (single partition) -> efficient and avoids "batch too large" from mixing tables
+            batch_v3 = BatchStatement(batch_type=BatchType.UNLOGGED)
+            prepared = []  # keep per-record prepared info so we can update latest + sampling after success
+
+            for record, ts, dv, ds in group:
                 try:
-                    device_id = record.get('device_id')
-                    if not device_id:
-                        logger.warning(
-                            f"Skipping record during batch preparation: missing device_id"
-                        )
-                        continue
-                        
-                    metadata_map = {}
-                    if record.get('metadata') and isinstance(record['metadata'], dict):
-                        metadata_map = {str(k): str(v) for k, v in record['metadata'].items()}
+                    metadata_map = _build_metadata_map(record)
 
-                    batch.add(self.insert_reading_stmt, (
-                        device_id,
-                        ds,
-                        ts,
-                        record.get('sensor_type', 'unknown'),
-                        float(record.get('value', 0)),
-                        record.get('unit', ''),
-                        float(record.get('original_value', record.get('value', 0))),
-                        record.get('original_unit', record.get('unit', '')),
-                        bool(record.get('is_anomaly', False)),
+                    v3_params = (
+                        record["device_id"],
+                        dv,                 # date (Cassandra date)
+                        ts,                 # timestamp
+                        record.get("sensor_type", "unknown"),
+                        float(record.get("value", 0)),
+                        record.get("unit", ""),
+                        float(record.get("original_value", record.get("value", 0))),
+                        record.get("original_unit", record.get("unit", "")),
+                        bool(record.get("is_anomaly", False)),
                         metadata_map
-                    ))
+                    )
 
-                    # Also update latest reading
-                    batch.add(self.update_latest_stmt, (
-                        device_id,
-                        record.get('sensor_type', 'unknown'),
+                    # legacy table uses date as TEXT (schema shows date text)
+                    v1_params = (
+                        record["device_id"],
+                        ds,                 # date (TEXT)
                         ts,
-                        float(record.get('value', 0)),
-                        record.get('unit', ''),
-                        bool(record.get('is_anomaly', False))
-                    ))
-                    batch_records.append(record)
-                except (ValueError, TypeError, KeyError) as e:
+                        record.get("sensor_type", "unknown"),
+                        float(record.get("value", 0)),
+                        record.get("unit", ""),
+                        float(record.get("original_value", record.get("value", 0))),
+                        record.get("original_unit", record.get("unit", "")),
+                        bool(record.get("is_anomaly", False)),
+                        metadata_map
+                    )
+
+                    latest_params = (
+                        record["device_id"],
+                        record.get("sensor_type", "unknown"),
+                        ts,
+                        float(record.get("value", 0)),
+                        record.get("unit", ""),
+                        bool(record.get("is_anomaly", False)),
+                    )
+
+                    batch_v3.add(self.insert_reading_v3_stmt, v3_params)
+                    prepared.append((v1_params, latest_params))
+
+                except Exception as e:
                     logger.warning(
-                        f"Skipping record during batch preparation: device_id={record.get('device_id')}, "
-                        f"error={e}"
+                        f"Skipping record during batch build: device_id={record.get('device_id')} err={e}"
                     )
                     continue
 
-            if not batch_records:
+            if not prepared:
                 continue
 
-            # Try batch write first
+            # Try batch v3 write
             try:
-                self.session.execute(batch)
-                successful_writes += len(batch_records)
+                self.session.execute(batch_v3)
+
+                # After successful v3 batch: update latest + sampling
+                for v1_params, latest_params in prepared:
+                    # latest update (separate to avoid cross-partition batches)
+                    try:
+                        self.session.execute(self.update_latest_stmt, latest_params)
+                    except Exception as e:
+                        logger.warning(f"device_latest update failed: device_id={latest_params[0]} err={e}")
+
+                    # Count successful v3 write
+                    successful_writes += 1
+                    self._sensor_readings_seen += 1
+
+                    # Sample to legacy table AFTER success, so it cannot be lost on batch failure
+                    if self.sensor_readings_sample_every > 0 and (
+                        self._sensor_readings_seen % self.sensor_readings_sample_every == 0
+                    ):
+                        try:
+                            self.session.execute(self.insert_reading_v1_stmt, v1_params)
+                            logger.info(
+                                f"[SAMPLED] wrote 1 row to sensor_readings at seen={self._sensor_readings_seen}"
+                            )
+                        except Exception as e:
+                            logger.warning(f"[SAMPLED-FAIL] sensor_readings insert failed: err={e}")
+
             except Exception as e:
-                logger.warning(f"Batch write failed for {device_id}/{date_str}: {e}, trying individual writes")
-                # Fallback to individual writes
-                for record in batch_records:
-                    if self._write_single_record(record):
+                # Batch failed (e.g. "Batch too large") -> do per-record v3 writes
+                logger.warning(
+                    f"Batch v3 write failed for device_id={device_id}, date={date_val}: {e}. Falling back to individual writes."
+                )
+
+                # Individual writes: v3 -> latest -> sampling
+                for (record, ts, dv, ds), (v1_params, latest_params) in zip(group, prepared):
+                    try:
+                        metadata_map = _build_metadata_map(record)
+                        v3_params = (
+                            record["device_id"], dv, ts,
+                            record.get("sensor_type", "unknown"),
+                            float(record.get("value", 0)),
+                            record.get("unit", ""),
+                            float(record.get("original_value", record.get("value", 0))),
+                            record.get("original_unit", record.get("unit", "")),
+                            bool(record.get("is_anomaly", False)),
+                            metadata_map
+                        )
+
+                        self.session.execute(self.insert_reading_v3_stmt, v3_params)
+
+                        # latest
+                        try:
+                            self.session.execute(self.update_latest_stmt, latest_params)
+                        except Exception as le:
+                            logger.warning(f"device_latest update failed: device_id={latest_params[0]} err={le}")
+
                         successful_writes += 1
+                        self._sensor_readings_seen += 1
+
+                        if self.sensor_readings_sample_every > 0 and (
+                            self._sensor_readings_seen % self.sensor_readings_sample_every == 0
+                        ):
+                            try:
+                                self.session.execute(self.insert_reading_v1_stmt, v1_params)
+                                logger.info(
+                                    f"[SAMPLED] wrote 1 row to sensor_readings at seen={self._sensor_readings_seen}"
+                                )
+                            except Exception as se:
+                                logger.warning(f"[SAMPLED-FAIL] sensor_readings insert failed: err={se}")
+
+                    except Exception as ie:
+                        logger.warning(
+                            f"Individual v3 write failed: device_id={record.get('device_id')} err={ie}"
+                        )
+                        continue
 
         self.write_count += successful_writes
 
@@ -342,11 +443,10 @@ class CassandraWriterService:
                 if self.buffer and (buffer_full or time_elapsed):
                     try:
                         buffer_size = len(self.buffer)
-                        # Store original count before write_batch modifies write_count
                         write_count_before = self.write_count
                         self.write_batch(self.buffer)
                         successful_count = self.write_count - write_count_before
-                        
+
                         # Only commit if we successfully wrote at least some records
                         if successful_count > 0:
                             self.consumer.commit()
@@ -354,13 +454,9 @@ class CassandraWriterService:
                                 f"[INFO] Processed {buffer_size} records to Cassandra "
                                 f"(Successfully wrote: {successful_count}, Total: {self.write_count})"
                             )
-                            # Only clear successfully processed records
-                            # Keep failed records in buffer for potential retry (but clear to avoid infinite loop)
-                            # In production, you might want a dead-letter queue here
                             self.buffer.clear()
                             self.last_flush_time = now
                         else:
-                            # All records failed - don't commit, but clear buffer to avoid infinite retry
                             logger.warning(
                                 f"All {buffer_size} records in batch failed to write. "
                                 "Clearing buffer to prevent infinite retry."
@@ -371,8 +467,6 @@ class CassandraWriterService:
                             f"Error writing batch to database: {e}, skipping batch. "
                             f"Buffer had {len(self.buffer)} records."
                         )
-                        # Clear buffer to prevent infinite retry of bad data
-                        # In production, consider a dead-letter queue
                         self.buffer.clear()
                         # Don't commit on error - will retry on next poll
 
@@ -416,6 +510,9 @@ def main():
         'cassandra_hosts': os.getenv('CASSANDRA_HOSTS', 'cassandra').split(','),
         'batch_size': int(os.getenv('BATCH_SIZE', '500')),
         'flush_interval': int(os.getenv('FLUSH_INTERVAL', '5')),
+        # Write 1 row into sensor_readings for every N rows written into sensor_readings_v3
+        # Set to 0 to disable legacy writes
+        'sensor_readings_sample_every': int(os.getenv('SENSOR_READINGS_SAMPLE_EVERY', '1000')),
     }
 
     service = CassandraWriterService(config)
@@ -429,3 +526,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
