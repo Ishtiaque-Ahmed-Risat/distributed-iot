@@ -1,5 +1,4 @@
 import os
-from sys import prefix
 
 import numpy as np
 import torch
@@ -100,6 +99,7 @@ def train():
     threshold = losses.mean() + 2 * losses.std()
 
     version = datetime.now().strftime("v%Y%m%d_%H%M%S")
+    out_dir = f"artifacts/anomaly-detector/{version}"
 
     export_bundle(
         model=model,
@@ -107,7 +107,7 @@ def train():
         mean=float(mean),
         std=float(std),
         threshold=float(threshold.item()),
-        out_dir=f"artifacts/anomaly-detector/{version}"
+        out_dir=out_dir
     )
 
     # ---- MinIO upload (version + latest) ----
