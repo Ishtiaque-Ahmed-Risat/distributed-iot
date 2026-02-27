@@ -9,7 +9,7 @@ echo "========================================"
 
 cd "$(dirname "$0")"
 
-docker compose down
+docker-compose down
 
 echo ""
 echo "Cloud services stopped."
