@@ -8,7 +8,7 @@ metadata:
     app: ingestion-service
     component: data-pipeline
 spec:
-  replicas: 6
+  replicas: 2
   selector:
     matchLabels:
       app: ingestion-service

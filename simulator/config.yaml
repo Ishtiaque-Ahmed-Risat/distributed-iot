@@ -8,12 +8,12 @@ mqtt:
 
 # Device Registry (optional - for registering devices with metadata)
 device_registry:
-  enabled: true  # Set to false to skip registration
+  enabled: false  # Set to false to skip registration
   url: "http://localhost:31080"  # K3s NodePort for device registry
 
 simulation:
-  num_devices: 10  # Start with 10 devices (scale up to 1000+)
-  interval_seconds: 10  # Publish every 10 seconds
+  num_devices: 100  # Start with 10 devices (scale up to 1000+)
+  interval_seconds: 0.1  # Publish every 10 seconds
 
 # Sensor type configurations
 sensor_types:
