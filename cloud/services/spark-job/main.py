@@ -13,26 +13,21 @@ Model artifacts are saved to MinIO (S3-compatible storage).
 import json
 import logging
 import os
-from pyclbr import Class
 import sys
 import io
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any
-import logging
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 import torch
 import torch.nn as nn
 import numpy as np
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType, BooleanType
 from sklearn.ensemble import IsolationForest
-from minio_uploader import export_bundle
-from model import upload_bundle_to_minio
 import joblib
 import boto3
 from botocore.client import Config as BotoConfig
-from model_update_publisher import publish_model_update
+from kafka import KafkaProducer
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +36,186 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ==================== ONNX Export Functions ====================
+
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+
+
+def export_bundle(model, window_size, mean, std, threshold, out_dir, feature_columns=None, model_name=None, version=None):
+    ensure_dir(out_dir)
+
+    if model_name is None:
+        model_name = os.getenv("AE_MODEL_NAME", "anomaly-detector-autoencoder")
+    if version is None:
+        version = os.path.basename(out_dir)
+
+    # 1) Export ONNX
+    model.eval()
+    dummy = torch.zeros(1, window_size, dtype=torch.float32)
+    onnx_path = os.path.join(out_dir, "model.onnx")
+
+    # IMPORTANT: use input/output names that match edge code: input/output
+    torch.onnx.export(
+        model,
+        dummy,
+        onnx_path,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+        opset_version=17
+    )
+
+    # 2) preprocess.json
+    # mean/std can be scalar (windowed) OR list (pivoted)
+    preprocess = {
+        "window_size": int(window_size),
+        "normalization": "zscore",
+        "mean": mean,
+        "std": std,
+    }
+    if feature_columns is not None:
+        preprocess["feature_columns"] = feature_columns
+
+    with open(os.path.join(out_dir, "preprocess.json"), "w") as f:
+        json.dump(preprocess, f, indent=2)
+
+    # 3) thresholds.json
+    thresholds = {
+        "type": "mse_reconstruction",
+        "mse_threshold": float(threshold),
+        # keep backward-compatible key too
+        "threshold": float(threshold),
+    }
+    with open(os.path.join(out_dir, "thresholds.json"), "w") as f:
+        json.dump(thresholds, f, indent=2)
+
+    # 4) metadata.json
+    metadata = {
+        "model_name": model_name,
+        "version": version,
+        "exported_at": int(time.time()),
+        "format": "onnx",
+        "opset": 17,
+    }
+    if feature_columns is not None:
+        metadata["n_features"] = len(feature_columns)
+
+    with open(os.path.join(out_dir, "metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info(f"Exported model bundle to: {out_dir}")
+    logger.info(f" - {onnx_path}")
+
+
+# ==================== MinIO Upload Functions ====================
+
+def _get_s3_client():
+    endpoint = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
+    access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    secret_key = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=BotoConfig(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
+
+
+def ensure_bucket(s3, bucket: str):
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except Exception:
+        s3.create_bucket(Bucket=bucket)
+
+
+def upload_file(s3, bucket: str, local_path: str, remote_key: str):
+    s3.upload_file(local_path, bucket, remote_key)
+
+
+def upload_bundle_to_minio(
+    local_dir: str,
+    model_name: str,
+    version: str,
+    bucket: str = None,
+) -> Tuple[str, str]:
+    """
+    Upload ONNX bundle directory to MinIO.
+
+    Expects these files in local_dir:
+      - model.onnx
+      - preprocess.json
+      - thresholds.json
+      - metadata.json
+
+    Uploads to:
+      models/<model_name>/<version>/...
+      models/<model_name>/latest/...
+
+    Returns (bucket, version_prefix).
+    """
+    if bucket is None:
+        bucket = os.getenv("MODEL_BUCKET", "iot-models")
+
+    required = ["model.onnx", "preprocess.json", "thresholds.json", "metadata.json"]
+    missing = [f for f in required if not os.path.exists(os.path.join(local_dir, f))]
+    if missing:
+        raise FileNotFoundError(f"Bundle missing files: {missing} in {local_dir}")
+
+    s3 = _get_s3_client()
+    ensure_bucket(s3, bucket)
+
+    version_prefix = f"models/{model_name}/{version}"
+    latest_prefix = f"models/{model_name}/latest"
+
+    uploads: List[Tuple[str, str]] = []
+    for f in required:
+        lp = os.path.join(local_dir, f)
+        uploads.append((lp, f"{version_prefix}/{f}"))
+        uploads.append((lp, f"{latest_prefix}/{f}"))
+
+    for local_path, remote_key in uploads:
+        upload_file(s3, bucket, local_path, remote_key)
+
+    return bucket, version_prefix
+
+
+# ==================== Model Update Publisher ====================
+
+def publish_model_update(
+    model_name: str,
+    version: str,
+    bucket: str,
+    prefix: str,
+):
+    brokers = os.getenv("REDPANDA_BROKERS", "redpanda:9092").split(",")
+    topic = os.getenv("MODEL_UPDATE_TOPIC", "model-updates")
+
+    producer = KafkaProducer(
+        bootstrap_servers=brokers,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        acks="all",
+    )
+
+    message = {
+        "model_name": model_name,
+        "version": version,
+        "bucket": bucket,
+        "prefix": prefix,
+    }
+
+    producer.send(topic, value=message).get(timeout=10)
+    producer.flush()
+    producer.close()
+
+    logger.info(f"Published model update: {message}")
+
+
+# ==================== Model Classes ====================
 
 class Autoencoder(nn.Module):
     def __init__(self, input_size):
@@ -222,8 +397,9 @@ class SparkBatchAnalyticsJob:
         feature_data = pivot_df.select(feature_cols).toPandas().values
 
         # Train Isolation Forest
+        n_estimators = int(self.config.get("if_n_estimators", 100))
         model = IsolationForest(
-            n_estimators=100,
+            n_estimators=n_estimators,
             contamination=0.05,  # Expect ~5% anomalies
             random_state=42,
             n_jobs=-1
@@ -330,6 +506,7 @@ class SparkBatchAnalyticsJob:
         version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out_dir = f"/tmp/{model_name}/{version}"
 
+        logger.info(f"Exporting ONNX bundle to {out_dir}...")
         export_bundle(
             model=model,
             window_size=input_size,
@@ -481,6 +658,8 @@ def main():
         'ae_epochs': int(os.getenv('AE_EPOCHS', '50')),
         'ae_lr': float(os.getenv('AE_LR', '0.001')),
         'ae_model_name': os.getenv('AE_MODEL_NAME', 'anomaly-detector-autoencoder'),
+        'ae_train_limit_rows': int(os.getenv('AE_TRAIN_LIMIT_ROWS', '50000')),
+        'if_n_estimators': int(os.getenv('IF_N_ESTIMATORS', '100')),
     }
 
     job = SparkBatchAnalyticsJob(config)
