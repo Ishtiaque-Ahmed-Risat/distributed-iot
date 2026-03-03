@@ -13,19 +13,26 @@ Model artifacts are saved to MinIO (S3-compatible storage).
 import json
 import logging
 import os
+from pyclbr import Class
 import sys
 import io
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
-
+import logging
+from typing import Dict, Any
+import torch
+import torch.nn as nn
 import numpy as np
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, TimestampType, BooleanType
 from sklearn.ensemble import IsolationForest
+from minio_uploader import export_bundle
+from model import upload_bundle_to_minio
 import joblib
 import boto3
 from botocore.client import Config as BotoConfig
+from model_update_publisher import publish_model_update
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +40,24 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class Autoencoder(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_size, 5),
+            nn.ReLU(),
+            nn.Linear(5, 2),
+            nn.ReLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(2, 5),
+            nn.ReLU(),
+            nn.Linear(5, input_size),
+        )
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
 
 
 class SparkBatchAnalyticsJob:
@@ -230,6 +255,119 @@ class SparkBatchAnalyticsJob:
         }
 
         return model_package
+    
+    def train_autoencoder_bundle_and_publish(self, df):
+        """
+        Train Autoencoder on pivoted feature vectors (same format as IsolationForest),
+        export ONNX bundle, upload to MinIO, publish model-update.
+        This matches edge buffering that waits for complete feature vectors.
+        """
+        if df.rdd.isEmpty():
+            logger.warning("No data available for autoencoder training")
+            return None
+
+        # 1) Pivot to (device_id, timestamp) rows with sensor_type columns
+        pivot_df = df.groupBy("device_id", "timestamp").pivot("sensor_type").agg(F.first("value"))
+
+        feature_cols = [c for c in pivot_df.columns if c not in ("device_id", "timestamp")]
+        if not feature_cols:
+            logger.warning("No feature columns found after pivot for AE training")
+            return None
+
+        # Optional: limit amount of data collected to driver
+        limit_rows = int(self.config.get("ae_train_limit_rows", 50000))
+        pivot_df = pivot_df.orderBy(F.col("timestamp").desc()).limit(limit_rows)
+
+        # Fill nulls with per-column mean (better than 0.0)
+        means_row = pivot_df.agg(*[F.avg(F.col(c)).alias(c) for c in feature_cols]).collect()[0].asDict()
+        for c in feature_cols:
+            pivot_df = pivot_df.fillna({c: float(means_row.get(c) or 0.0)})
+
+        # Collect to driver for PyTorch training
+        pdf = pivot_df.select(feature_cols).toPandas()
+        X = pdf.to_numpy(dtype=np.float32)
+
+        if X.shape[0] < 200:
+            logger.warning(f"Not enough samples for AE training (n={X.shape[0]})")
+            return None
+
+        # 2) Per-feature standardization (mean/std vectors)
+        mu = X.mean(axis=0).astype(np.float32)
+        sigma = X.std(axis=0).astype(np.float32)
+        sigma[sigma < 1e-6] = 1.0
+        Xn = (X - mu) / sigma
+
+        # 3) Train AE (input_size = number of features)
+        input_size = Xn.shape[1]
+        epochs = int(self.config.get("ae_epochs", 50))
+        lr = float(self.config.get("ae_lr", 1e-3))
+
+        torch.manual_seed(0)
+        model = Autoencoder(input_size=input_size)
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+        loss_fn = nn.MSELoss()
+
+        Xt = torch.tensor(Xn, dtype=torch.float32)
+
+        model.train()
+        for _ in range(epochs):
+            opt.zero_grad()
+            recon = model(Xt)
+            loss = loss_fn(recon, Xt)
+            loss.backward()
+            opt.step()
+
+        # 4) Threshold
+        model.eval()
+        with torch.no_grad():
+            recon = model(Xt)
+            losses = torch.mean((recon - Xt) ** 2, dim=1).cpu().numpy()
+
+        threshold = float(losses.mean() + 2.0 * losses.std())
+
+        # 5) Export bundle
+        model_name = self.config.get("ae_model_name", "anomaly-detector-autoencoder")
+        version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        out_dir = f"/tmp/{model_name}/{version}"
+
+        export_bundle(
+            model=model,
+            window_size=input_size,
+            mean=mu.tolist(),
+            std=sigma.tolist(),
+            threshold=threshold,
+            out_dir=out_dir,
+            feature_columns=feature_cols, 
+        )
+
+        bucket = self.config["model_bucket"]
+        bucket, prefix = upload_bundle_to_minio(
+            local_dir=out_dir,
+            model_name=model_name,
+            version=version,
+            bucket=bucket,
+        )
+
+        publish_model_update(
+            model_name=model_name,
+            version=version,
+            bucket=bucket,
+            prefix=prefix,
+        )
+
+        logger.info(
+            f"✓ Published pivot-AE bundle: model={model_name} version={version} "
+            f"features={len(feature_cols)} thr={threshold:.6f} minio={bucket}/{prefix}"
+        )
+
+        return {
+            "model_name": model_name,
+            "version": version,
+            "feature_columns": feature_cols,
+            "threshold": threshold,
+            "bucket": bucket,
+            "prefix": prefix,
+        }
 
     def save_model_to_minio(self, model_package: Dict):
         """Save trained model to MinIO"""
@@ -319,6 +457,10 @@ class SparkBatchAnalyticsJob:
             logger.info(f"Records processed: {df.count()}")
             logger.info(f"{'=' * 50}")
 
+            # Step 4: Train autoencoder + publish ONNX bundle for edge
+            logger.info("\n--- Step 4: Training autoencoder model (ONNX bundle) ---")
+            self.train_autoencoder_bundle_and_publish(df)
+
         finally:
             # Always stop Spark session
             if self.spark:
@@ -334,6 +476,11 @@ def main():
         'minio_secret_key': os.getenv('MINIO_SECRET_KEY', 'minioadmin'),
         'model_bucket': os.getenv('MODEL_BUCKET', 'iot-models'),
         'hours_back': int(os.getenv('HOURS_BACK', '24')),
+        'train_sensor_type': os.getenv('TRAIN_SENSOR_TYPE', ''),
+        'ae_window_size': int(os.getenv('AE_WINDOW_SIZE', '10')),
+        'ae_epochs': int(os.getenv('AE_EPOCHS', '50')),
+        'ae_lr': float(os.getenv('AE_LR', '0.001')),
+        'ae_model_name': os.getenv('AE_MODEL_NAME', 'anomaly-detector-autoencoder'),
     }
 
     job = SparkBatchAnalyticsJob(config)

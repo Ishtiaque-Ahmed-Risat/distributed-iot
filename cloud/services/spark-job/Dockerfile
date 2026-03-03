@@ -15,6 +15,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY minio_uploader.py .
+COPY model.py .
+COPY model_update_publisher.py .
+COPY training ./training
 
 # This container exits after the job completes
 CMD ["python", "-u", "main.py"]

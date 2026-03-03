@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from collections import defaultdict
 
-import joblib
+import onnxruntime as ort
 import numpy as np
 import boto3
 from botocore.client import Config as BotoConfig
@@ -149,8 +149,10 @@ class AnomalyAlertService:
             'max_buffer_size': int(os.getenv('MAX_BUFFER_SIZE', '10000')),
         }
         
-        self.model = None
+        self.session = None
         self.feature_columns = []
+        self.preprocess = {}
+        self.thresholds = {}       
         self.model_metadata = {}
         self.current_model_version = None
         self.s3_client = None
@@ -174,70 +176,66 @@ class AnomalyAlertService:
         logger.info(f"✓ Connected to MinIO: {self.config['minio_endpoint']}")
 
     def download_model(self) -> bool:
-        """Download and hot-swap model from MinIO atomically"""
         try:
             bucket = self.config['model_bucket']
-            
-            # Download metadata first
-            metadata_buffer = io.BytesIO()
-            self.s3_client.download_fileobj(
-                bucket,
-                'models/anomaly_detection/latest_metadata.json',
-                metadata_buffer
-            )
-            metadata_buffer.seek(0)
-            metadata = json.loads(metadata_buffer.read().decode())
-            
-            model_version = metadata.get('trained_at', 'unknown')
-            
-            # Check if we need to update
-            if model_version == self.current_model_version and self.model is not None:
-                logger.debug(f"Model already up to date: {model_version}")
+            model_name = os.getenv("MODEL_NAME", "anomaly-detector-autoencoder")
+            base = f"models/{model_name}/latest"
+
+            # metadata.json (version)
+            md = io.BytesIO()
+            self.s3_client.download_fileobj(bucket, f"{base}/metadata.json", md)
+            md.seek(0)
+            metadata = json.loads(md.read().decode("utf-8"))
+            model_version = metadata.get("version") or metadata.get("trained_at") or "unknown"
+
+            if model_version == self.current_model_version and self.session is not None:
                 return False
-            
-            # Download model to temporary buffer
-            logger.info(f"Downloading new model version: {model_version}")
-            model_buffer = io.BytesIO()
-            self.s3_client.download_fileobj(
-                bucket,
-                'models/anomaly_detection/latest.joblib',
-                model_buffer
-            )
-            model_buffer.seek(0)
-            
-            # Load new model (outside lock, takes time)
-            new_model = joblib.load(model_buffer)
-            new_features = metadata.get('feature_columns', [])
-            new_metadata = metadata
-            
-            # Atomic swap with lock (very brief lock time)
+
+            logger.info(f"Downloading new AE bundle version: {model_version}")
+
+            # preprocess.json
+            pp = io.BytesIO()
+            self.s3_client.download_fileobj(bucket, f"{base}/preprocess.json", pp)
+            pp.seek(0)
+            preprocess = json.loads(pp.read().decode("utf-8"))
+
+            # thresholds.json
+            th = io.BytesIO()
+            self.s3_client.download_fileobj(bucket, f"{base}/thresholds.json", th)
+            th.seek(0)
+            thresholds = json.loads(th.read().decode("utf-8"))
+
+            # model.onnx
+            onnx_buf = io.BytesIO()
+            self.s3_client.download_fileobj(bucket, f"{base}/model.onnx", onnx_buf)
+            onnx_bytes = onnx_buf.getvalue()
+
+            new_sess = ort.InferenceSession(onnx_bytes, providers=["CPUExecutionProvider"])
+
             with self.model_lock:
-                old_version = self.current_model_version
-                self.model = new_model
-                self.feature_columns = new_features
-                self.model_metadata = new_metadata
+                old = self.current_model_version
+                self.session = new_sess
+                # feature order tulee preprocess.json:stä (tai metadata.json:stä)
+                self.feature_columns = preprocess.get("feature_columns", preprocess.get("feature_order", []))
+                self.preprocess = preprocess
+                self.thresholds = thresholds
+                self.model_metadata = metadata
                 self.current_model_version = model_version
-            
-            # Log update (outside lock)
-            if old_version is None:
-                logger.info(f"✓ Loaded initial model: {model_version}")
-                logger.info(f"  Features: {new_features}")
-                logger.info(f"  Training samples: {metadata.get('training_samples', 'N/A')}")
-                logger.info(f"  Anomaly ratio: {metadata.get('anomaly_ratio', 'N/A'):.2%}")
+
+            if old is None:
+                logger.info(f"✓ Loaded initial AE model: {model_version}")
             else:
-                logger.warning(f"🔄 Model updated: {old_version} → {model_version}")
-            
+                logger.warning(f"🔄 AE model updated: {old} → {model_version}")
+
+            logger.info(f"  Features: {self.feature_columns}")
+            logger.info(f"  mse_threshold={thresholds.get('mse_threshold')}")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Failed to download/swap model: {e}")
-            if self.model is None:
-                # No model yet - log warning
-                logger.warning("⚠️  No model available in MinIO yet")
-                logger.warning("   Service will run in pass-through mode (no inference)")
-                logger.warning("   Waiting for model to be trained and uploaded...")
+            logger.error(f"Failed to download/swap AE bundle: {e}")
+            if self.session is None:
+                logger.warning("⚠️  No AE model available yet - waiting...")
                 return False
-            # Keep old model on failure
             logger.warning("Keeping previous model version")
             return False
 
@@ -301,34 +299,51 @@ class AnomalyAlertService:
             return None
 
     def run_inference(self, device_id: str, feature_dict: Dict[str, float], timestamp: str) -> Optional[Dict[str, Any]]:
-        """Run anomaly detection on aggregated features (thread-safe)"""
-        # Acquire lock briefly to get consistent model snapshot
         with self.model_lock:
-            if self.model is None:
+            if self.session is None:
                 return None
-            # Get references under lock
-            model = self.model
-            metadata = self.model_metadata
-        
-        # Run inference outside lock (time-consuming)
-        features = self.prepare_features(feature_dict)
-        if features is None:
-            return None
-        
+            sess = self.session
+            feature_columns = self.feature_columns.copy()
+            preprocess = dict(self.preprocess)
+            thresholds = dict(self.thresholds)
+
+        vec = []
+        for name in feature_columns:
+            v = feature_dict.get(name)
+            if v is None:
+                return None
+            vec.append(float(v))
+
+        x = np.array(vec, dtype=np.float32)
+
+        mean = preprocess.get("mean", 0.0)
+        std = preprocess.get("std", 1.0)
+
+        if isinstance(mean, list):
+            mean = np.asarray(mean, dtype=np.float32)
+            std = np.asarray(std, dtype=np.float32)
+            std = np.where(std < 1e-12, 1.0, std)
+            xn = (x - mean) / std
+        else:
+            m = float(mean)
+            s = float(std) if float(std) > 1e-12 else 1.0
+            xn = (x - m) / s
+
+        xb = xn.reshape(1, -1)
+
         try:
-            # Predict: 1 = normal, -1 = anomaly
-            prediction = model.predict(features)[0]
-            score = model.decision_function(features)[0]
-            
+            recon = sess.run(["output"], {"input": xb})[0]
+            mse = float(np.mean((recon - xb) ** 2))
+            thr = float(thresholds.get("mse_threshold", thresholds.get("threshold", 0.0)))
+
             return {
-                'is_anomaly': prediction == -1,
-                'anomaly_score': float(score),
-                'threshold': metadata.get('score_stats', {}).get('threshold', 0.0),
-                'device_id': device_id,
-                'features': feature_dict,
-                'timestamp': timestamp
+                "is_anomaly": mse > thr,
+                "anomaly_score": mse,
+                "threshold": thr,
+                "device_id": device_id,
+                "features": feature_dict,
+                "timestamp": timestamp,
             }
-        
         except Exception as e:
             logger.error(f"Inference failed: {e}")
             return None
