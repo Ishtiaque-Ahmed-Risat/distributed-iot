@@ -293,12 +293,25 @@ class SparkBatchAnalyticsJob:
         start_time = now - timedelta(hours=hours_back)
 
         logger.info(f"Fetching data from Cassandra (last {hours_back} hours)...")
+        logger.info(f"Time range: {start_time} to {now}")
 
         # Read from Cassandra using Spark
+        # Spark Cassandra connector will scan all partitions
         df = self.spark.read \
             .format("org.apache.spark.sql.cassandra") \
             .options(table="sensor_readings", keyspace="iot_data") \
             .load()
+
+        # Debug: check total rows before filtering
+        total_count = df.count()
+        logger.info(f"Total rows in sensor_readings table (before filter): {total_count}")
+
+        # Show sample data structure
+        if total_count > 0:
+            logger.info("Sample data structure:")
+            df.select("device_id", "date", "timestamp", "sensor_type", "value").show(5, truncate=False)
+            logger.info(f"Unique devices: {df.select('device_id').distinct().count()}")
+            logger.info(f"Date range in data: {df.agg(F.min('timestamp').alias('min_ts'), F.max('timestamp').alias('max_ts')).collect()}")
 
         # Filter by timestamp
         df = df.filter(
@@ -307,10 +320,11 @@ class SparkBatchAnalyticsJob:
         )
 
         count = df.count()
-        logger.info(f"Fetched {count} records from Cassandra")
+        logger.info(f"Fetched {count} records from Cassandra (after timestamp filter)")
         
         if count == 0:
             logger.warning("No data found in the specified time range")
+            logger.warning(f"Consider checking if data timestamps are in UTC and match the filter range")
         
         return df
 
@@ -368,25 +382,32 @@ class SparkBatchAnalyticsJob:
             return None
 
         count = df.count()
-        if count < 10:
+        if count < 1:
             logger.warning(f"Not enough data to train model (only {count} records)")
             return None
 
         logger.info("Training anomaly detection model (IsolationForest)...")
+        logger.info(f"Input DataFrame: {count} rows")
+        logger.info(f"Unique (device_id, timestamp) combinations: {df.select('device_id', 'timestamp').distinct().count()}")
+        logger.info(f"Unique sensor types: {df.select('sensor_type').distinct().collect()}")
 
         # Pivot data: each row is (device_id, timestamp) with sensor values as columns
         pivot_df = df.groupBy("device_id", "timestamp").pivot("sensor_type").agg(
             F.first("value")
         )
 
+        pivot_count = pivot_df.count()
+        logger.info(f"After pivot: {pivot_count} rows")
+
         # Get feature columns (sensor types)
         feature_cols = [col for col in pivot_df.columns if col not in ['device_id', 'timestamp']]
         
         if not feature_cols:
             logger.warning("No feature columns found after pivot")
+            logger.warning(f"Pivot columns: {pivot_df.columns}")
             return None
 
-        logger.info(f"Training on {count} samples with {len(feature_cols)} features: {feature_cols}")
+        logger.info(f"Training on {pivot_count} samples with {len(feature_cols)} features: {feature_cols}")
 
         # Fill nulls with 0 (or could use mean)
         for col in feature_cols:
@@ -443,11 +464,18 @@ class SparkBatchAnalyticsJob:
             return None
 
         # 1) Pivot to (device_id, timestamp) rows with sensor_type columns
+        logger.info(f"Input DataFrame for AE: {df.count()} rows")
+        logger.info(f"Unique (device_id, timestamp) combinations: {df.select('device_id', 'timestamp').distinct().count()}")
+        
         pivot_df = df.groupBy("device_id", "timestamp").pivot("sensor_type").agg(F.first("value"))
+
+        pivot_count = pivot_df.count()
+        logger.info(f"After pivot: {pivot_count} rows")
 
         feature_cols = [c for c in pivot_df.columns if c not in ("device_id", "timestamp")]
         if not feature_cols:
             logger.warning("No feature columns found after pivot for AE training")
+            logger.warning(f"Pivot columns: {pivot_df.columns}")
             return None
 
         # Optional: limit amount of data collected to driver
@@ -463,7 +491,7 @@ class SparkBatchAnalyticsJob:
         pdf = pivot_df.select(feature_cols).toPandas()
         X = pdf.to_numpy(dtype=np.float32)
 
-        if X.shape[0] < 200:
+        if X.shape[0] < 1:
             logger.warning(f"Not enough samples for AE training (n={X.shape[0]})")
             return None
 
