@@ -12,6 +12,9 @@ ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 WORKDIR /app
 
 COPY requirements.txt .
+# Install CPU-only PyTorch (lighter weight)
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.5.1+cpu
+# Install other requirements
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .

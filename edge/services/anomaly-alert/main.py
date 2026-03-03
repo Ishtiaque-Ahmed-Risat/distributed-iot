@@ -4,11 +4,11 @@ Anomaly Alert Service
 Consumes transformed sensor data, aggregates by device+time window,
 runs ML inference on complete feature vectors, and logs anomalies.
 
-- Downloads model from MinIO on startup
-- Polls for model updates every 60 seconds
+- Downloads existing model from MinIO on startup (from 'latest' path)
+- Polls MinIO for model updates at regular interval
 - Buffers sensor readings to match training format (pivoted features)
 - Independent consumer group for non-blocking operation
-- Graceful restart on model updates
+- Atomic model hot-swapping without downtime
 """
 
 import json
@@ -18,7 +18,7 @@ import sys
 import time
 import io
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any
 from collections import defaultdict
 
@@ -27,7 +27,6 @@ import numpy as np
 import boto3
 from botocore.client import Config as BotoConfig
 from kafka import KafkaConsumer
-from kafka.errors import KafkaError
 
 # Configure logging
 logging.basicConfig(
@@ -133,7 +132,15 @@ class SensorBuffer:
 
 
 class AnomalyAlertService:
-    """Real-time anomaly detection on edge data streams"""
+    """
+    Real-time anomaly detection on edge data streams.
+    
+    - Downloads model from MinIO on startup (from 'latest' path)
+    - Polls MinIO for model updates at regular interval
+    - Buffers sensor readings to aggregate complete feature vectors
+    - Performs ONNX inference for anomaly detection
+    - Atomically hot-swaps models without downtime
+    """
 
     def __init__(self):
         self.config = {
@@ -144,7 +151,8 @@ class AnomalyAlertService:
             'minio_access_key': os.getenv('MINIO_ACCESS_KEY', 'minioadmin'),
             'minio_secret_key': os.getenv('MINIO_SECRET_KEY', 'minioadmin'),
             'model_bucket': os.getenv('MODEL_BUCKET', 'iot-models'),
-            'update_interval': int(os.getenv('MODEL_UPDATE_INTERVAL', '60')),
+            'model_name': os.getenv('MODEL_NAME', 'anomaly-detector-autoencoder'),
+            'update_interval': int(os.getenv('MODEL_UPDATE_INTERVAL', '30')),
             'buffer_window': int(os.getenv('BUFFER_WINDOW_SECONDS', '10')),
             'max_buffer_size': int(os.getenv('MAX_BUFFER_SIZE', '10000')),
         }
@@ -165,21 +173,41 @@ class AnomalyAlertService:
 
     def setup_minio(self):
         """Connect to MinIO"""
-        self.s3_client = boto3.client(
-            's3',
-            endpoint_url=self.config['minio_endpoint'],
-            aws_access_key_id=self.config['minio_access_key'],
-            aws_secret_access_key=self.config['minio_secret_key'],
-            config=BotoConfig(signature_version='s3v4', connect_timeout=5, read_timeout=10),
-            region_name='us-east-1'
-        )
-        logger.info(f"✓ Connected to MinIO: {self.config['minio_endpoint']}")
+        try:
+            self.s3_client = boto3.client(
+                's3',
+                endpoint_url=self.config['minio_endpoint'],
+                aws_access_key_id=self.config['minio_access_key'],
+                aws_secret_access_key=self.config['minio_secret_key'],
+                config=BotoConfig(signature_version='s3v4', connect_timeout=5, read_timeout=10),
+                region_name='us-east-1'
+            )
+            logger.info(f"✓ Connected to MinIO: {self.config['minio_endpoint']}")
+        except Exception as e:
+            logger.error(f"✗ Failed to connect to MinIO: {e}")
+            raise
 
-    def download_model(self) -> bool:
+    def download_model(self, model_name: str = None, prefix: str = None) -> bool:
+        """
+        Download model from MinIO and perform atomic hot-swap.
+        
+        If prefix is provided, downloads from that specific version path.
+        Otherwise, downloads from 'latest' path (used for polling).
+        
+        Returns True if model was updated, False if same version or error.
+        """
+        if self.s3_client is None:
+            logger.error("✗ MinIO client not available - cannot download model")
+            raise RuntimeError("MinIO client not initialized - service should not have started")
+        
         try:
             bucket = self.config['model_bucket']
-            model_name = os.getenv("MODEL_NAME", "anomaly-detector-autoencoder")
-            base = f"models/{model_name}/latest"
+            if model_name is None:
+                model_name = self.config['model_name']
+            if prefix is None:
+                base = f"models/{model_name}/latest"
+            else:
+                base = prefix
 
             # metadata.json (version)
             md = io.BytesIO()
@@ -189,9 +217,10 @@ class AnomalyAlertService:
             model_version = metadata.get("version") or metadata.get("trained_at") or "unknown"
 
             if model_version == self.current_model_version and self.session is not None:
+                logger.debug(f"Model version {model_version} already loaded, skipping download")
                 return False
 
-            logger.info(f"Downloading new AE bundle version: {model_version}")
+            logger.info(f"Downloading model bundle: version={model_version}, path={base}")
 
             # preprocess.json
             pp = io.BytesIO()
@@ -210,57 +239,64 @@ class AnomalyAlertService:
             self.s3_client.download_fileobj(bucket, f"{base}/model.onnx", onnx_buf)
             onnx_bytes = onnx_buf.getvalue()
 
+            # Load new model FIRST (atomic swap)
             new_sess = ort.InferenceSession(onnx_bytes, providers=["CPUExecutionProvider"])
+            new_feature_columns = preprocess.get("feature_columns", preprocess.get("feature_order", []))
 
+            # Atomic swap: update all model state at once
             with self.model_lock:
                 old = self.current_model_version
+                old_session = self.session
                 self.session = new_sess
-                # feature order tulee preprocess.json:stä (tai metadata.json:stä)
-                self.feature_columns = preprocess.get("feature_columns", preprocess.get("feature_order", []))
+                self.feature_columns = new_feature_columns
                 self.preprocess = preprocess
                 self.thresholds = thresholds
                 self.model_metadata = metadata
                 self.current_model_version = model_version
 
-            if old is None:
-                logger.info(f"✓ Loaded initial AE model: {model_version}")
-            else:
-                logger.warning(f"🔄 AE model updated: {old} → {model_version}")
+            # Old session will be garbage collected after lock is released
+            if old_session is not None:
+                del old_session
 
-            logger.info(f"  Features: {self.feature_columns}")
-            logger.info(f"  mse_threshold={thresholds.get('mse_threshold')}")
+            if old is None:
+                logger.info(f"✓ Successfully loaded initial model: version={model_version}, features={len(new_feature_columns)}, threshold={thresholds.get('mse_threshold', 'N/A')}")
+            else:
+                logger.info(f"✓ Successfully swapped model atomically: {old} → {model_version} (features={len(new_feature_columns)})")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to download/swap AE bundle: {e}")
             if self.session is None:
-                logger.warning("⚠️  No AE model available yet - waiting...")
-                return False
-            logger.warning("Keeping previous model version")
+                logger.warning(f"⚠️  No model available - download failed: {e}")
+            else:
+                logger.warning(f"⚠️  Model download failed, keeping previous version {self.current_model_version}: {e}")
             return False
 
     def model_update_loop(self):
-        """Background thread to check for model updates and hot-swap"""
-        logger.info(f"Model update checker started (interval: {self.config['update_interval']}s)")
+        """Background thread to poll MinIO for model updates"""
+        interval = self.config['update_interval']
+        logger.info(f"Model update checker started - polling MinIO every {interval} seconds")
         
         # Add initial random delay to stagger checks across replicas (0-30s)
-        # Reduces MinIO load spikes when multiple pods check simultaneously
         import random
         initial_delay = random.uniform(0, 30)
-        logger.info(f"Initial delay: {initial_delay:.1f}s (staggers checks across replicas)")
         time.sleep(initial_delay)
         
-        while True:  # Run forever, no restart needed
-            time.sleep(self.config['update_interval'])
-            try:
-                updated = self.download_model()
-                if updated:
-                    logger.info("Model update complete - continuing inference with new model")
-            except Exception as e:
-                logger.error(f"Model update check failed: {e}")
+        last_poll_time = time.time()
+        
+        while True:
+            current_time = time.time()
+            if current_time - last_poll_time >= self.config['update_interval']:
+                try:
+                    updated = self.download_model()  # Polls 'latest' path
+                    last_poll_time = current_time
+                except Exception as e:
+                    logger.error(f"✗ Model update check (polling) failed: {e}")
+                    last_poll_time = current_time  # Still update time to avoid tight error loop
+            
+            time.sleep(1)  # Small sleep to prevent busy waiting
 
     def setup_kafka(self):
-        """Setup Kafka consumer"""
+        """Setup Kafka consumer for sensor data (not for model updates)"""
         self.consumer = KafkaConsumer(
             self.config['kafka_topic'],
             bootstrap_servers=self.config['kafka_brokers'],
@@ -273,7 +309,7 @@ class AnomalyAlertService:
             heartbeat_interval_ms=10000,
         )
         logger.info(f"✓ Connected to Kafka: {self.config['kafka_brokers']}")
-        logger.info(f"  Topic: {self.config['kafka_topic']}")
+        logger.info(f"  Topic: {self.config['kafka_topic']} (sensor data)")
         logger.info(f"  Consumer group: {self.config['consumer_group']}")
 
     def prepare_features(self, feature_dict: Dict[str, float]) -> Optional[np.ndarray]:
@@ -299,6 +335,7 @@ class AnomalyAlertService:
             return None
 
     def run_inference(self, device_id: str, feature_dict: Dict[str, float], timestamp: str) -> Optional[Dict[str, Any]]:
+        # Check if model is available (thread-safe)
         with self.model_lock:
             if self.session is None:
                 return None
@@ -348,41 +385,46 @@ class AnomalyAlertService:
             logger.error(f"Inference failed: {e}")
             return None
 
-    def process_message(self, message: Dict[str, Any]):
-        """Process a single sensor reading"""
+    def process_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Process a single sensor reading. Returns inference result if available, None otherwise."""
         device_id = message.get('device_id')
         sensor_type = message.get('sensor_type')
         value = message.get('value')
         timestamp = message.get('timestamp')
         
         if not all([device_id, sensor_type, value is not None, timestamp]):
-            logger.warning("Incomplete message, skipping")
-            return
+            logger.debug("Incomplete message, skipping")
+            return None
+        
+        # Check if model is available before processing
+        with self.model_lock:
+            has_model = self.session is not None
+            if has_model:
+                feature_columns = self.feature_columns.copy()
+        
+        if not has_model:
+            logger.debug(f"No model available - discarding message for device={device_id}, sensor={sensor_type}")
+            return None
         
         # Add to buffer
         self.sensor_buffer.add_reading(device_id, sensor_type, value, timestamp)
         
         # Try to get complete reading
-        complete_features = self.sensor_buffer.get_complete_reading(device_id, self.feature_columns)
+        complete_features = self.sensor_buffer.get_complete_reading(device_id, feature_columns)
         
         if complete_features:
             # Run inference on complete feature vector
             result = self.run_inference(device_id, complete_features, timestamp)
             
             if result and result['is_anomaly']:
-                # Log anomaly with details
-                features_str = ', '.join([f"{k}={v:.2f}" for k, v in complete_features.items()])
                 logger.warning(
-                    f"🚨 ANOMALY DETECTED | "
-                    f"device={device_id} | "
-                    f"features=[{features_str}] | "
-                    f"score={result['anomaly_score']:.4f} | "
-                    f"threshold={result['threshold']:.4f} | "
-                    f"timestamp={timestamp}"
+                    f"🚨 ANOMALY | device={device_id} | score={result['anomaly_score']:.4f} | threshold={result['threshold']:.4f}"
                 )
             
             # Clear buffer for this device after inference
             self.sensor_buffer.remove_device(device_id)
+            
+            return result  # Return result for tracking
 
     def run(self):
         """Main processing loop"""
@@ -393,24 +435,22 @@ class AnomalyAlertService:
         # Setup connections
         self.setup_minio()
         
-        # Try to download model (don't crash if not available)
+        # Try to download existing model at startup (from 'latest' path)
         has_model = self.download_model()
         if not has_model:
-            logger.warning("⚠️  Starting without ML model - will retry every 60s")
+            logger.warning("⚠️  Starting without ML model - will poll MinIO for updates")
         
         self.setup_kafka()
         
-        # Start model update checker in background
+        # Start model update checker in background (polls MinIO periodically)
         update_thread = threading.Thread(target=self.model_update_loop, daemon=True)
         update_thread.start()
         
         logger.info("=" * 60)
         if has_model:
-            logger.info("🚀 Ready to process messages with ML inference")
+            logger.info(f"🚀 Ready to process messages with ML inference (model version: {self.current_model_version})")
         else:
-            logger.info("🚀 Ready to process messages (pass-through mode, waiting for model)")
-        logger.info(f"   Buffer window: {self.config['buffer_window']}s")
-        logger.info(f"   Max buffer size: {self.config['max_buffer_size']} devices")
+            logger.info("🚀 Ready to process messages (waiting for model)")
         logger.info("=" * 60)
         
         processed = 0
@@ -421,18 +461,17 @@ class AnomalyAlertService:
             for message in self.consumer:
                 data = message.value
                 
-                self.process_message(data)
+                result = self.process_message(data)
                 processed += 1
+                if result and result.get('is_anomaly'):
+                    anomalies += 1
                 
                 # Periodic stats
                 if time.time() - last_stats_time > 60:
                     buffer_stats = self.sensor_buffer.get_stats()
-                    logger.info(
-                        f"📊 Processed: {processed} messages | "
-                        f"Buffered devices: {buffer_stats['total_devices']} | "
-                        f"Buffered readings: {buffer_stats['total_readings']}"
-                    )
+                    logger.info(f"Stats: processed={processed}, buffered_devices={buffer_stats['total_devices']}, anomalies={anomalies}")
                     last_stats_time = time.time()
+                    anomalies = 0  # Reset counter
         
         except KeyboardInterrupt:
             logger.info("Shutting down gracefully...")

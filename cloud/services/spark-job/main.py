@@ -23,11 +23,8 @@ import torch.nn as nn
 import numpy as np
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from sklearn.ensemble import IsolationForest
-import joblib
 import boto3
 from botocore.client import Config as BotoConfig
-from kafka import KafkaProducer
 
 # Configure logging
 logging.basicConfig(
@@ -105,8 +102,7 @@ def export_bundle(model, window_size, mean, std, threshold, out_dir, feature_col
     with open(os.path.join(out_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
-    logger.info(f"Exported model bundle to: {out_dir}")
-    logger.info(f" - {onnx_path}")
+    logger.info(f"✓ Exported ONNX bundle: {out_dir}")
 
 
 # ==================== MinIO Upload Functions ====================
@@ -145,6 +141,8 @@ def upload_bundle_to_minio(
 ) -> Tuple[str, str]:
     """
     Upload ONNX bundle directory to MinIO.
+    
+    Edge services poll MinIO periodically to check for model updates.
 
     Expects these files in local_dir:
       - model.onnx
@@ -153,8 +151,8 @@ def upload_bundle_to_minio(
       - metadata.json
 
     Uploads to:
-      models/<model_name>/<version>/...
-      models/<model_name>/latest/...
+      models/<model_name>/<version>/...  (versioned path)
+      models/<model_name>/latest/...     (latest path for polling)
 
     Returns (bucket, version_prefix).
     """
@@ -178,41 +176,17 @@ def upload_bundle_to_minio(
         uploads.append((lp, f"{version_prefix}/{f}"))
         uploads.append((lp, f"{latest_prefix}/{f}"))
 
-    for local_path, remote_key in uploads:
-        upload_file(s3, bucket, local_path, remote_key)
+    logger.info(f"Uploading model bundle to MinIO: bucket={bucket}, version={version_prefix}, latest={latest_prefix}")
+    try:
+        for local_path, remote_key in uploads:
+            upload_file(s3, bucket, local_path, remote_key)
+        logger.info(f"✓ Successfully uploaded model bundle to MinIO: {bucket}/{version_prefix}")
+        return bucket, version_prefix
+    except Exception as e:
+        logger.error(f"✗ Failed to upload model bundle to MinIO: {e}", exc_info=True)
+        raise
 
-    return bucket, version_prefix
 
-
-# ==================== Model Update Publisher ====================
-
-def publish_model_update(
-    model_name: str,
-    version: str,
-    bucket: str,
-    prefix: str,
-):
-    brokers = os.getenv("REDPANDA_BROKERS", "redpanda:9092").split(",")
-    topic = os.getenv("MODEL_UPDATE_TOPIC", "model-updates")
-
-    producer = KafkaProducer(
-        bootstrap_servers=brokers,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        acks="all",
-    )
-
-    message = {
-        "model_name": model_name,
-        "version": version,
-        "bucket": bucket,
-        "prefix": prefix,
-    }
-
-    producer.send(topic, value=message).get(timeout=10)
-    producer.flush()
-    producer.close()
-
-    logger.info(f"Published model update: {message}")
 
 
 # ==================== Model Classes ====================
@@ -372,90 +346,9 @@ class SparkBatchAnalyticsJob:
         logger.info(f"Computed aggregations for {len(stats)} device/sensor combinations")
         return stats
 
-    def train_anomaly_model(self, df):
-        """
-        Train an Isolation Forest anomaly detection model.
-        Uses Spark for data preparation, sklearn for model training.
-        """
-        if df.rdd.isEmpty():
-            logger.warning("No data available for training")
-            return None
-
-        count = df.count()
-        if count < 1:
-            logger.warning(f"Not enough data to train model (only {count} records)")
-            return None
-
-        logger.info("Training anomaly detection model (IsolationForest)...")
-        logger.info(f"Input DataFrame: {count} rows")
-        logger.info(f"Unique (device_id, timestamp) combinations: {df.select('device_id', 'timestamp').distinct().count()}")
-        logger.info(f"Unique sensor types: {df.select('sensor_type').distinct().collect()}")
-
-        # Pivot data: each row is (device_id, timestamp) with sensor values as columns
-        pivot_df = df.groupBy("device_id", "timestamp").pivot("sensor_type").agg(
-            F.first("value")
-        )
-
-        pivot_count = pivot_df.count()
-        logger.info(f"After pivot: {pivot_count} rows")
-
-        # Get feature columns (sensor types)
-        feature_cols = [col for col in pivot_df.columns if col not in ['device_id', 'timestamp']]
-        
-        if not feature_cols:
-            logger.warning("No feature columns found after pivot")
-            logger.warning(f"Pivot columns: {pivot_df.columns}")
-            return None
-
-        logger.info(f"Training on {pivot_count} samples with {len(feature_cols)} features: {feature_cols}")
-
-        # Fill nulls with 0 (or could use mean)
-        for col in feature_cols:
-            pivot_df = pivot_df.fillna({col: 0.0})
-
-        # Collect feature data to numpy array for sklearn
-        # For huge datasets, you'd use Spark ML instead, but sklearn is simpler
-        feature_data = pivot_df.select(feature_cols).toPandas().values
-
-        # Train Isolation Forest
-        n_estimators = int(self.config.get("if_n_estimators", 100))
-        model = IsolationForest(
-            n_estimators=n_estimators,
-            contamination=0.05,  # Expect ~5% anomalies
-            random_state=42,
-            n_jobs=-1
-        )
-        model.fit(feature_data)
-
-        # Score the training data
-        scores = model.decision_function(feature_data)
-        predictions = model.predict(feature_data)
-        n_anomalies = (predictions == -1).sum()
-
-        logger.info(
-            f"Model trained on {len(feature_data)} samples, {len(feature_cols)} features. "
-            f"Detected {n_anomalies} anomalies ({100*n_anomalies/len(feature_data):.1f}%)"
-        )
-
-        # Package model with metadata
-        model_package = {
-            'model': model,
-            'feature_columns': feature_cols,
-            'training_samples': len(feature_data),
-            'anomaly_ratio': float(n_anomalies / len(feature_data)),
-            'trained_at': datetime.now(timezone.utc).isoformat(),
-            'score_stats': {
-                'mean': float(scores.mean()),
-                'std': float(scores.std()),
-                'threshold': float(np.percentile(scores, 5))
-            }
-        }
-
-        return model_package
-    
     def train_autoencoder_bundle_and_publish(self, df):
         """
-        Train Autoencoder on pivoted feature vectors (same format as IsolationForest),
+        Train Autoencoder on pivoted feature vectors,
         export ONNX bundle, upload to MinIO, publish model-update.
         This matches edge buffering that waits for complete feature vectors.
         """
@@ -503,7 +396,7 @@ class SparkBatchAnalyticsJob:
 
         # 3) Train AE (input_size = number of features)
         input_size = Xn.shape[1]
-        epochs = int(self.config.get("ae_epochs", 50))
+        epochs = int(self.config.get("ae_epochs", 5))
         lr = float(self.config.get("ae_lr", 1e-3))
 
         torch.manual_seed(0)
@@ -534,7 +427,7 @@ class SparkBatchAnalyticsJob:
         version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         out_dir = f"/tmp/{model_name}/{version}"
 
-        logger.info(f"Exporting ONNX bundle to {out_dir}...")
+        logger.info(f"Exporting ONNX bundle: model={model_name}, version={version}, features={len(feature_cols)}")
         export_bundle(
             model=model,
             window_size=input_size,
@@ -553,17 +446,8 @@ class SparkBatchAnalyticsJob:
             bucket=bucket,
         )
 
-        publish_model_update(
-            model_name=model_name,
-            version=version,
-            bucket=bucket,
-            prefix=prefix,
-        )
-
-        logger.info(
-            f"✓ Published pivot-AE bundle: model={model_name} version={version} "
-            f"features={len(feature_cols)} thr={threshold:.6f} minio={bucket}/{prefix}"
-        )
+        logger.info(f"✓ Model training and upload complete: {model_name} v{version} (threshold={threshold:.6f})")
+        logger.info(f"  Model available at: {bucket}/{prefix}")
 
         return {
             "model_name": model_name,
@@ -573,41 +457,6 @@ class SparkBatchAnalyticsJob:
             "bucket": bucket,
             "prefix": prefix,
         }
-
-    def save_model_to_minio(self, model_package: Dict):
-        """Save trained model to MinIO"""
-        if model_package is None:
-            return
-
-        bucket = self.config['model_bucket']
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-
-        # Save model artifact (serialize once, use twice)
-        model_buffer = io.BytesIO()
-        joblib.dump(model_package['model'], model_buffer)
-        model_data = model_buffer.getvalue()
-
-        # Upload versioned model
-        model_key = f"models/anomaly_detection/model_{timestamp}.joblib"
-        self.s3_client.upload_fileobj(io.BytesIO(model_data), bucket, model_key)
-        logger.info(f"✓ Saved model to MinIO: {model_key}")
-
-        # Also save as 'latest' for edge to pull
-        self.s3_client.upload_fileobj(io.BytesIO(model_data), bucket, "models/anomaly_detection/latest.joblib")
-        logger.info("✓ Updated 'latest' model pointer")
-
-        # Save metadata
-        metadata = {
-            'feature_columns': model_package['feature_columns'],
-            'training_samples': model_package['training_samples'],
-            'anomaly_ratio': model_package['anomaly_ratio'],
-            'trained_at': model_package['trained_at'],
-            'score_stats': model_package['score_stats'],
-            'model_path': model_key
-        }
-        metadata_buffer = io.BytesIO(json.dumps(metadata, indent=2).encode())
-        self.s3_client.upload_fileobj(metadata_buffer, bucket, "models/anomaly_detection/latest_metadata.json")
-        logger.info("✓ Saved model metadata")
 
     def save_stats_to_minio(self, stats: Dict):
         """Save aggregation stats to MinIO"""
@@ -651,20 +500,15 @@ class SparkBatchAnalyticsJob:
             stats = self.compute_aggregations(df)
             self.save_stats_to_minio(stats)
 
-            # Step 3: Train anomaly detection model
-            logger.info("\n--- Step 3: Training anomaly detection model ---")
-            model_package = self.train_anomaly_model(df)
-            self.save_model_to_minio(model_package)
+            # Step 3: Train autoencoder + publish ONNX bundle for edge
+            logger.info("\n--- Step 3: Training autoencoder model (ONNX bundle) ---")
+            self.train_autoencoder_bundle_and_publish(df)
 
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
             logger.info(f"\n{'=' * 50}")
             logger.info(f"Job completed in {elapsed:.1f}s")
             logger.info(f"Records processed: {df.count()}")
             logger.info(f"{'=' * 50}")
-
-            # Step 4: Train autoencoder + publish ONNX bundle for edge
-            logger.info("\n--- Step 4: Training autoencoder model (ONNX bundle) ---")
-            self.train_autoencoder_bundle_and_publish(df)
 
         finally:
             # Always stop Spark session
@@ -681,13 +525,10 @@ def main():
         'minio_secret_key': os.getenv('MINIO_SECRET_KEY', 'minioadmin'),
         'model_bucket': os.getenv('MODEL_BUCKET', 'iot-models'),
         'hours_back': int(os.getenv('HOURS_BACK', '24')),
-        'train_sensor_type': os.getenv('TRAIN_SENSOR_TYPE', ''),
-        'ae_window_size': int(os.getenv('AE_WINDOW_SIZE', '10')),
         'ae_epochs': int(os.getenv('AE_EPOCHS', '50')),
         'ae_lr': float(os.getenv('AE_LR', '0.001')),
         'ae_model_name': os.getenv('AE_MODEL_NAME', 'anomaly-detector-autoencoder'),
         'ae_train_limit_rows': int(os.getenv('AE_TRAIN_LIMIT_ROWS', '50000')),
-        'if_n_estimators': int(os.getenv('IF_N_ESTIMATORS', '100')),
     }
 
     job = SparkBatchAnalyticsJob(config)

@@ -49,19 +49,21 @@ spec:
           value: "minioadmin"
         - name: MODEL_BUCKET
           value: "iot-models"
+        - name: MODEL_NAME
+          value: "anomaly-detector-autoencoder"
         - name: MODEL_UPDATE_INTERVAL
-          value: "60"
+          value: "30"
         - name: BUFFER_WINDOW_SECONDS
           value: "10"
         - name: MAX_BUFFER_SIZE
           value: "10000"
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "200m"
+            memory: "384Mi"
+            cpu: "300m"
           limits:
-            memory: "512Mi"
-            cpu: "500m"
+            memory: "768Mi"
+            cpu: "1000m"
         readinessProbe:
           exec:
             command:
