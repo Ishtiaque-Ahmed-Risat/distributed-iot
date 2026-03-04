@@ -14,7 +14,6 @@ import sys
 from typing import Dict, Any
 import paho.mqtt.client as mqtt
 from kafka import KafkaProducer
-from kafka.errors import KafkaError
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +32,9 @@ class IngestionService:
         self.kafka_producer = None
         self.message_count = 0
         self.running = False
+        # Generate client_id once per pod instance for session persistence
+        # Each pod gets a unique ID, but reuses it across reconnections
+        self.mqtt_client_id = f"ingestion-{uuid.uuid4()}"
         
     def setup_kafka(self):
         """Initialize Kafka/Redpanda producer with ordering guarantees"""
@@ -62,19 +64,30 @@ class IngestionService:
             raise
     
     def on_connect(self, client, userdata, flags, rc):
-        """MQTT connection callback with shared subscription for load balancing"""
+        """
+        MQTT connection callback with shared subscription for load balancing.
+        
+        Message Loss Behavior:
+        - If ONE pod goes down: No message loss (other pods handle the load)
+        - If ALL pods go down: Potential message loss (messages distributed to available subscribers)
+        - In-flight messages (QoS 1/2): Redelivered on reconnect within 30min session window
+        - clean_session=False preserves in-flight messages but NOT messages arriving while disconnected
+        """
         if rc == 0:
             logger.info(f"✓ Connected to MQTT broker: {self.config['mqtt_broker']}")
             
             # Use MQTT shared subscription for load balancing across multiple replicas
             # Format: $share/group-name/topic-pattern
             # This ensures multiple ingestion pods share the load (no duplicates)
+            # IMPORTANT: Shared subscriptions distribute to AVAILABLE subscribers only.
+            # Messages arriving while a pod is down go to other pods, not queued for the disconnected pod.
             shared_topic = f"$share/ingestion-group/{self.config['mqtt_topic']}"
             
             result, mid = client.subscribe(shared_topic, qos=1)
             if result == mqtt.MQTT_ERR_SUCCESS:
                 logger.info(f"✓ Subscribed to shared topic: {shared_topic}")
                 logger.info("✓ Load will be distributed across all ingestion replicas")
+                logger.info("⚠ Note: Messages arriving while pod is down go to other pods (not queued)")
             else:
                 logger.error(f"✗ Failed to subscribe: error code {result}")
         else:
@@ -89,10 +102,18 @@ class IngestionService:
             logger.info("Will retry connection automatically...")
     
     def on_disconnect(self, client, userdata, rc):
-        """MQTT disconnection callback"""
+        """
+        MQTT disconnection callback.
+        
+        With clean_session=False:
+        - In-flight QoS 1/2 messages will be redelivered on reconnect
+        - Session persists for 30 minutes (EMQX_MQTT__SESSION_EXPIRY_INTERVAL)
+        - After 30 minutes, session expires and queued messages are lost
+        """
         if rc != 0:
             logger.warning(f"✗ Unexpected disconnect from MQTT broker (rc={rc})")
             logger.info("Auto-reconnection will attempt to restore connection...")
+            logger.info("In-flight messages (QoS 1/2) will be redelivered on reconnect (within 30min)")
         else:
             logger.info("Clean disconnect from MQTT broker")
     
@@ -144,17 +165,30 @@ class IngestionService:
         logger.error(f"Failed to send message to Redpanda: {exc}")
     
     def setup_mqtt(self):
-        """Initialize MQTT client with fault-tolerant reconnection"""
-        # Create client with unique ID per pod for shared subscriptions
-        # Unique client_id allows multiple ingestion replicas to connect simultaneously
-        import os
-        client_id = f"ingestion-{uuid.uuid4()}"
+        """
+        Initialize MQTT client with fault-tolerant reconnection.
+        
+        Session Persistence (clean_session=False):
+        - Preserves in-flight QoS 1/2 messages during disconnects
+        - Redelivers unacknowledged messages on reconnect (within 30min session window)
+        - Maintains subscription state across reconnections
+        
+        Limitations:
+        - Messages arriving while pod is down are NOT queued (shared subscription distributes to available pods)
+        - Session expires after 30 minutes of disconnection (EMQX config)
+        - Only protects in-flight messages, not messages published while disconnected
+        """
+        # Reuse client_id per pod instance for session persistence
+        # Unique client_id per pod allows multiple ingestion replicas to connect simultaneously
+        # clean_session=False enables session persistence: subscriptions and in-flight messages
+        # are maintained across reconnections, reducing message loss during disconnects
         
         self.mqtt_client = mqtt.Client(
-            client_id=client_id,
-            clean_session=True
+            client_id=self.mqtt_client_id,
+            clean_session=False  # Enable session persistence for fault tolerance
         )
-        logger.info(f"MQTT Client ID: {client_id}")
+        logger.info(f"MQTT Client ID: {self.mqtt_client_id} (persistent session enabled)")
+        logger.info("Session expiry: 30 minutes (messages arriving while down go to other pods)")
         
         # Set callbacks
         self.mqtt_client.on_connect = self.on_connect
@@ -169,7 +203,8 @@ class IngestionService:
         broker_host, broker_port = self.parse_mqtt_broker(self.config['mqtt_broker'])
         
         logger.info(f"Connecting to MQTT broker {broker_host}:{broker_port}...")
-        logger.info("Auto-reconnect enabled with persistent session (QoS 1)")
+        logger.info("Auto-reconnect enabled with persistent session (QoS 1, clean_session=False)")
+        logger.info("Session will persist across reconnections: subscriptions and in-flight messages preserved")
         
         try:
             # Initial connection attempt
