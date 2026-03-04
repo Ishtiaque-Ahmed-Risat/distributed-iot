@@ -72,7 +72,7 @@ Train an anomaly detection model on historical data:
 
 ```bash
 cd cloud
-docker-compose -f docker-compose.yml -f docker-compose.job.yml run --rm spark-job
+./run-spark-job.sh
 ```
 
 This analyzes the last 24 hours of data, trains an Isolation Forest model, and saves it to MinIO.
