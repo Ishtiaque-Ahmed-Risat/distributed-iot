@@ -13,7 +13,8 @@ device_registry:
 
 simulation:
   num_devices: 10  # Start with 10 devices (scale up to 1000+)
-  interval_seconds: 10  # Publish every 10 seconds
+  interval_seconds: 0.5  # Publish every 10 seconds
+  max_messages: null  # Maximum number of messages to publish (null = unlimited)
 
 # Sensor type configurations
 sensor_types:

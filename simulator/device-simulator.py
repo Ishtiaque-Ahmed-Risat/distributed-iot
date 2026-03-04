@@ -23,6 +23,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global message counter (no lock)
+global_message_count = 0
+
 
 class SensorSimulator:
     """Simulates a single sensor on a device"""
@@ -56,7 +59,7 @@ class SensorSimulator:
             'sensor_type': self.sensor_type,
             'value': round(self.value, 2),
             'unit': self.config['unit'],
-            'timestamp': int(datetime.utcnow().timestamp()),
+            'timestamp': datetime.utcnow().timestamp(),
             'is_anomaly': is_anomaly
         }
 
@@ -119,6 +122,7 @@ class DeviceClient:
 
     def _publish_loop(self):
         """Main loop: publish all sensor readings at configured interval"""
+        global global_message_count
         # Stagger startup to avoid thundering herd
         jitter = random.uniform(0, self.interval)
         time.sleep(jitter)
@@ -137,9 +141,11 @@ class DeviceClient:
                     )
                     if result.rc == mqtt.MQTT_ERR_SUCCESS:
                         self.message_count += 1
+                        global_message_count += 1
                     elif result.rc == mqtt.MQTT_ERR_NO_CONN:
                         logger.warning(f"[{self.device_id}] Not connected — message queued")
                         self.message_count += 1  # QoS 1 queues it
+                        global_message_count += 1
                     else:
                         logger.error(f"[{self.device_id}] Publish failed (rc={result.rc})")
                 except Exception as e:
@@ -147,7 +153,8 @@ class DeviceClient:
 
             elapsed = time.time() - start
             sleep_time = max(0, self.interval - elapsed)
-            time.sleep(sleep_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     def start(self):
         """Start this device's MQTT client and publishing thread"""
@@ -249,6 +256,12 @@ class IoTDeviceSimulator:
         interval = self.config['simulation']['interval_seconds']
         logger.info(f"Starting {len(self.devices)} independent device clients (interval: {interval}s)")
 
+        # Get message limit from config, default to infinity if null
+        max_messages = self.config['simulation'].get('max_messages')
+        if max_messages is None:
+            max_messages = float('inf')
+        logger.info(f"Message limit: {max_messages if max_messages != float('inf') else 'unlimited'}")
+
         # Start all devices
         for device in self.devices:
             device.start()
@@ -256,15 +269,19 @@ class IoTDeviceSimulator:
         logger.info(f"All {len(self.devices)} devices started")
 
         # Monitor loop
+        global global_message_count
         try:
             while True:
-                time.sleep(30)
+                time.sleep(0.1)
                 total = sum(d.message_count for d in self.devices)
                 connected = sum(1 for d in self.devices if d.connected)
                 logger.info(
                     f"[Monitor] Devices: {connected}/{len(self.devices)} connected | "
                     f"Total messages: {total}"
                 )
+                if global_message_count >= max_messages:
+                    logger.info(f"Global message count reached {global_message_count}, stopping simulator")
+                    break
         except KeyboardInterrupt:
             logger.info("Simulation stopped by user")
         finally:
@@ -276,6 +293,7 @@ class IoTDeviceSimulator:
         for device in self.devices:
             device.stop()
         logger.info("All devices stopped")
+        logger.info(f"Global message count: {global_message_count}")
 
 
 def main():
