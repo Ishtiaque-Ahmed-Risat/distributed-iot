@@ -2,7 +2,7 @@
 
 ## Architecture
 
-![System Architecture](docs/architecture.png)
+![System Architecture](kuvat/architecture.png)
 
 
 ## Prerequisites
