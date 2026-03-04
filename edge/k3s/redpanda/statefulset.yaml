@@ -8,7 +8,7 @@ metadata:
     app: redpanda
 spec:
   serviceName: redpanda-headless
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: redpanda
