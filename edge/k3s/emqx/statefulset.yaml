@@ -9,7 +9,7 @@ metadata:
     component: mqtt-broker
 spec:
   serviceName: emqx-headless  # Headless service for stable network identity
-  replicas: 2  # Default 2 for HA, scale to 3+ with demo-mode.sh
+  replicas: 4  # Default 2 for HA, scale to 3+ with demo-mode.sh
   podManagementPolicy: Parallel  # Parallel pod creation for faster startup
   selector:
     matchLabels:
