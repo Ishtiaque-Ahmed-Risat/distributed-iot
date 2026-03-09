@@ -467,7 +467,7 @@ class AnomalyAlertService:
                     anomalies += 1
                 
                 # Periodic stats
-                if time.time() - last_stats_time > 60:
+                if time.time() - last_stats_time > 10:
                     buffer_stats = self.sensor_buffer.get_stats()
                     logger.info(f"Stats: processed={processed}, buffered_devices={buffer_stats['total_devices']}, anomalies={anomalies}")
                     last_stats_time = time.time()
